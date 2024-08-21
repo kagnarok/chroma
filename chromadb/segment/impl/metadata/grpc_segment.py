@@ -1,4 +1,5 @@
 from typing import Dict, List, Optional, Sequence
+from chromadb.proto.utils import RetryOnRpcErrorClientInterceptor
 from chromadb.segment import MetadataReader
 from chromadb.config import System
 from chromadb.types import Segment
@@ -7,6 +8,7 @@ from chromadb.telemetry.opentelemetry import (
     OpenTelemetryGranularity,
     trace_method,
 )
+from chromadb.telemetry.opentelemetry.grpc import OtelInterceptor
 from chromadb.types import (
     Where,
     WhereDocument,
@@ -20,15 +22,19 @@ import grpc
 class GrpcMetadataSegment(MetadataReader):
     """Embedding Metadata segment interface"""
 
+    _request_timeout_seconds: int
     _metadata_reader_stub: MetadataReaderStub
     _segment: Segment
 
     def __init__(self, system: System, segment: Segment) -> None:
-        super().__init__(system, segment)
+        super().__init__(system, segment)  # type: ignore[safe-super]
         if not segment["metadata"] or not segment["metadata"]["grpc_url"]:
             raise Exception("Missing grpc_url in segment metadata")
 
         self._segment = segment
+        self._request_timeout_seconds = system.settings.require(
+            "chroma_query_request_timeout_seconds"
+        )
 
     @override
     def start(self) -> None:
@@ -36,11 +42,20 @@ class GrpcMetadataSegment(MetadataReader):
             raise Exception("Missing grpc_url in segment metadata")
 
         channel = grpc.insecure_channel(self._segment["metadata"]["grpc_url"])
+        interceptors = [OtelInterceptor(), RetryOnRpcErrorClientInterceptor()]
+        channel = grpc.intercept_channel(channel, *interceptors)
         self._metadata_reader_stub = MetadataReaderStub(channel)  # type: ignore
 
     @override
     def count(self) -> int:
-        raise NotImplementedError()
+        request: pb.CountRecordsRequest = pb.CountRecordsRequest(
+            segment_id=self._segment["id"].hex,
+            collection_id=self._segment["collection"].hex,
+        )
+        response: pb.CountRecordsResponse = self._metadata_reader_stub.CountRecords(
+            request, timeout=self._request_timeout_seconds
+        )
+        return response.count
 
     @override
     def delete(self, where: Optional[Where] = None) -> None:
@@ -65,12 +80,17 @@ class GrpcMetadataSegment(MetadataReader):
     ) -> Sequence[MetadataEmbeddingRecord]:
         """Query for embedding metadata."""
 
-        where_pb = self._where_to_proto(where)
-        where_document_pb = self._where_document_to_proto(where_document)
         request: pb.QueryMetadataRequest = pb.QueryMetadataRequest(
             segment_id=self._segment["id"].hex,
-            where=where_pb,
-            where_document=where_document_pb,
+            collection_id=self._segment["collection"].hex,
+            where=self._where_to_proto(where)
+            if where is not None and len(where) > 0
+            else None,
+            where_document=(
+                self._where_document_to_proto(where_document)
+                if where_document is not None and len(where_document) > 0
+                else None
+            ),
             ids=ids,
             limit=limit,
             offset=offset,
@@ -82,7 +102,7 @@ class GrpcMetadataSegment(MetadataReader):
             raise ValueError("Limit cannot be negative")
 
         response: pb.QueryMetadataResponse = self._metadata_reader_stub.QueryMetadata(
-            request
+            request, timeout=self._request_timeout_seconds
         )
         results: List[MetadataEmbeddingRecord] = []
         for record in response.records:
@@ -133,6 +153,11 @@ class GrpcMetadataSegment(MetadataReader):
                     ssc.value = value
                     ssc.comparator = pb.GenericComparator.EQ
                     dc.single_string_operand.CopyFrom(ssc)
+                elif type(value) is bool:
+                    sbc = pb.SingleBoolComparison()
+                    sbc.value = value
+                    sbc.comparator = pb.GenericComparator.EQ
+                    dc.single_bool_operand.CopyFrom(sbc)
                 elif type(value) is int:
                     sic = pb.SingleIntComparison()
                     sic.value = value
@@ -172,6 +197,12 @@ class GrpcMetadataSegment(MetadataReader):
                                 slo.values.extend([x])  # type: ignore
                             slo.list_operator = list_operator
                             dc.string_list_operand.CopyFrom(slo)
+                        elif type(operand[0]) is bool:
+                            blo = pb.BoolListComparison()
+                            for x in operand:
+                                blo.values.extend([x])  # type: ignore
+                            blo.list_operator = list_operator
+                            dc.bool_list_operand.CopyFrom(blo)
                         elif type(operand[0]) is int:
                             ilo = pb.IntListComparison()
                             for x in operand:
@@ -202,6 +233,18 @@ class GrpcMetadataSegment(MetadataReader):
                                     f"Expected where operator to be $eq or $ne, got {operator}"
                                 )
                             dc.single_string_operand.CopyFrom(ssc)
+                        elif type(operand) is bool:
+                            sbc = pb.SingleBoolComparison()
+                            sbc.value = operand
+                            if operator == "$eq":
+                                sbc.comparator = pb.GenericComparator.EQ
+                            elif operator == "$ne":
+                                sbc.comparator = pb.GenericComparator.NE
+                            else:
+                                raise ValueError(
+                                    f"Expected where operator to be $eq or $ne, got {operator}"
+                                )
+                            dc.single_bool_operand.CopyFrom(sbc)
                         elif type(operand) is int:
                             sic = pb.SingleIntComparison()
                             sic.value = operand
@@ -305,10 +348,12 @@ class GrpcMetadataSegment(MetadataReader):
     def _from_proto(
         self, record: pb.MetadataEmbeddingRecord
     ) -> MetadataEmbeddingRecord:
-        translated_metadata: Dict[str, str | int | float] = {}
+        translated_metadata: Dict[str, str | int | float | bool] = {}
         record_metadata_map = record.metadata.metadata
         for key, value in record_metadata_map.items():
-            if value.HasField("string_value"):
+            if value.HasField("bool_value"):
+                translated_metadata[key] = value.bool_value
+            elif value.HasField("string_value"):
                 translated_metadata[key] = value.string_value
             elif value.HasField("int_value"):
                 translated_metadata[key] = value.int_value

@@ -2,6 +2,7 @@ from concurrent import futures
 from typing import Any, Dict, cast
 from uuid import UUID
 from overrides import overrides
+from chromadb.api.configuration import CollectionConfigurationInternal
 from chromadb.config import DEFAULT_DATABASE, DEFAULT_TENANT, Component, System
 from chromadb.proto.convert import (
     from_proto_metadata,
@@ -200,9 +201,7 @@ class GrpcMockSysDB(SysDBServicer, Component):
             if request.HasField("scope")
             else None
         )
-        target_collection = (
-            UUID(hex=request.collection) if request.HasField("collection") else None
-        )
+        target_collection = UUID(hex=request.collection)
 
         found_segments = []
         for segment in self._segments.values():
@@ -232,10 +231,6 @@ class GrpcMockSysDB(SysDBServicer, Component):
             )
         else:
             segment = self._segments[id_to_update.hex]
-            if request.HasField("collection"):
-                segment["collection"] = UUID(hex=request.collection)
-            if request.HasField("reset_collection") and request.reset_collection:
-                segment["collection"] = None
             if request.HasField("metadata"):
                 target = cast(Dict[str, Any], segment["metadata"])
                 if segment["metadata"] is None:
@@ -310,14 +305,20 @@ class GrpcMockSysDB(SysDBServicer, Component):
                 )
             )
 
+        configuration = CollectionConfigurationInternal.from_json_str(
+            request.configuration_json_str
+        )
+
         id = UUID(hex=request.id)
         new_collection = Collection(
             id=id,
             name=request.name,
+            configuration=configuration,
             metadata=from_proto_metadata(request.metadata),
             dimension=request.dimension,
             database=database,
             tenant=tenant,
+            version=0,
         )
         collections[request.id] = new_collection
         return CreateCollectionResponse(

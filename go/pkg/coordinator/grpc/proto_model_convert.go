@@ -17,6 +17,8 @@ func convertCollectionMetadataToModel(collectionMetadata *coordinatorpb.UpdateMe
 	metadata := model.NewCollectionMetadata[model.CollectionMetadataValueType]()
 	for key, value := range collectionMetadata.Metadata {
 		switch v := (value.Value).(type) {
+		case *coordinatorpb.UpdateMetadataValue_BoolValue:
+			metadata.Add(key, &model.CollectionMetadataValueBoolType{Value: v.BoolValue})
 		case *coordinatorpb.UpdateMetadataValue_StringValue:
 			metadata.Add(key, &model.CollectionMetadataValueStringType{Value: v.StringValue})
 		case *coordinatorpb.UpdateMetadataValue_IntValue:
@@ -38,13 +40,14 @@ func convertCollectionToProto(collection *model.Collection) *coordinatorpb.Colle
 	}
 
 	collectionpb := &coordinatorpb.Collection{
-		Id:          collection.ID.String(),
-		Name:        collection.Name,
-		Dimension:   collection.Dimension,
-		Tenant:      collection.TenantID,
-		Database:    collection.DatabaseName,
-		LogPosition: collection.LogPosition,
-		Version:     collection.Version,
+		Id:                   collection.ID.String(),
+		Name:                 collection.Name,
+		ConfigurationJsonStr: collection.ConfigurationJsonStr,
+		Dimension:            collection.Dimension,
+		Tenant:               collection.TenantID,
+		Database:             collection.DatabaseName,
+		LogPosition:          collection.LogPosition,
+		Version:              collection.Version,
 	}
 	if collection.Metadata == nil {
 		return collectionpb
@@ -64,6 +67,12 @@ func convertCollectionMetadataToProto(collectionMetadata *model.CollectionMetada
 	}
 	for key, value := range collectionMetadata.Metadata {
 		switch v := (value).(type) {
+		case *model.CollectionMetadataValueBoolType:
+			metadatapb.Metadata[key] = &coordinatorpb.UpdateMetadataValue{
+				Value: &coordinatorpb.UpdateMetadataValue_BoolValue{
+					BoolValue: v.Value,
+				},
+			}
 		case *model.CollectionMetadataValueStringType:
 			metadatapb.Metadata[key] = &coordinatorpb.UpdateMetadataValue{
 				Value: &coordinatorpb.UpdateMetadataValue_StringValue{
@@ -103,13 +112,14 @@ func convertToCreateCollectionModel(req *coordinatorpb.CreateCollectionRequest) 
 	}
 
 	return &model.CreateCollection{
-		ID:           collectionID,
-		Name:         req.Name,
-		Dimension:    req.Dimension,
-		Metadata:     metadata,
-		GetOrCreate:  req.GetGetOrCreate(),
-		TenantID:     req.GetTenant(),
-		DatabaseName: req.GetDatabase(),
+		ID:                   collectionID,
+		Name:                 req.Name,
+		ConfigurationJsonStr: req.ConfigurationJsonStr,
+		Dimension:            req.Dimension,
+		Metadata:             metadata,
+		GetOrCreate:          req.GetGetOrCreate(),
+		TenantID:             req.GetTenant(),
+		DatabaseName:         req.GetDatabase(),
 	}, nil
 }
 
@@ -126,6 +136,8 @@ func convertSegmentMetadataToModel(segmentMetadata *coordinatorpb.UpdateMetadata
 			continue
 		}
 		switch v := (value.Value).(type) {
+		case *coordinatorpb.UpdateMetadataValue_BoolValue:
+			metadata.Set(key, &model.SegmentMetadataValueBoolType{Value: v.BoolValue})
 		case *coordinatorpb.UpdateMetadataValue_StringValue:
 			metadata.Set(key, &model.SegmentMetadataValueStringType{Value: v.StringValue})
 		case *coordinatorpb.UpdateMetadataValue_IntValue:
@@ -156,15 +168,9 @@ func convertSegmentToProto(segment *model.Segment) *coordinatorpb.Segment {
 		Id:         segment.ID.String(),
 		Type:       segment.Type,
 		Scope:      segmentSceope,
-		Collection: nil,
+		Collection: segment.CollectionID.String(),
 		Metadata:   nil,
 		FilePaths:  filePaths,
-	}
-
-	collectionID := segment.CollectionID
-	if collectionID != types.NilUniqueID() {
-		collectionIDString := collectionID.String()
-		segmentpb.Collection = &collectionIDString
 	}
 
 	if segment.Metadata == nil {
@@ -184,6 +190,10 @@ func convertSegmentMetadataToProto(segmentMetadata *model.SegmentMetadata[model.
 
 	for key, value := range segmentMetadata.Metadata {
 		switch v := value.(type) {
+		case *model.SegmentMetadataValueBoolType:
+			metadatapb.Metadata[key] = &coordinatorpb.UpdateMetadataValue{
+				Value: &coordinatorpb.UpdateMetadataValue_BoolValue{BoolValue: v.Value},
+			}
 		case *model.SegmentMetadataValueStringType:
 			metadatapb.Metadata[key] = &coordinatorpb.UpdateMetadataValue{
 				Value: &coordinatorpb.UpdateMetadataValue_StringValue{StringValue: v.Value},
@@ -210,9 +220,9 @@ func convertSegmentToModel(segmentpb *coordinatorpb.Segment) (*model.CreateSegme
 		return nil, common.ErrSegmentIDFormat
 	}
 
-	collectionID, err := types.ToUniqueID(segmentpb.Collection)
+	collectionID, err := types.ToUniqueID(&segmentpb.Collection)
 	if err != nil {
-		log.Error("collection id format error", zap.String("collectionpd.id", *segmentpb.Collection))
+		log.Error("collection id format error", zap.String("collectionpd.id", segmentpb.Collection))
 		return nil, common.ErrCollectionIDFormat
 	}
 

@@ -1,13 +1,11 @@
-use crate::errors::ChromaError;
-use crate::errors::ErrorCodes;
 use crate::execution::operator::Operator;
 use crate::log::log::Log;
 use crate::log::log::UpdateCollectionLogOffsetError;
 use crate::sysdb::sysdb::FlushCompactionError;
 use crate::sysdb::sysdb::SysDb;
-use crate::types::FlushCompactionResponse;
-use crate::types::SegmentFlushInfo;
 use async_trait::async_trait;
+use chroma_error::{ChromaError, ErrorCodes};
+use chroma_types::{FlushCompactionResponse, SegmentFlushInfo};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -45,8 +43,8 @@ pub struct RegisterInput {
     log_position: i64,
     collection_version: i32,
     segment_flush_info: Arc<[SegmentFlushInfo]>,
-    sysdb: Box<dyn SysDb>,
-    log: Box<dyn Log>,
+    sysdb: Box<SysDb>,
+    log: Box<Log>,
 }
 
 impl RegisterInput {
@@ -57,8 +55,8 @@ impl RegisterInput {
         log_position: i64,
         collection_version: i32,
         segment_flush_info: Arc<[SegmentFlushInfo]>,
-        sysdb: Box<dyn SysDb>,
-        log: Box<dyn Log>,
+        sysdb: Box<SysDb>,
+        log: Box<Log>,
     ) -> Self {
         RegisterInput {
             tenant,
@@ -97,13 +95,15 @@ impl ChromaError for RegisterError {
     }
 }
 
-pub type RegisterResult = Result<RegisterOutput, RegisterError>;
-
 #[async_trait]
 impl Operator<RegisterInput, RegisterOutput> for RegisterOperator {
     type Error = RegisterError;
 
-    async fn run(&self, input: &RegisterInput) -> RegisterResult {
+    fn get_name(&self) -> &'static str {
+        "RegisterOperator"
+    }
+
+    async fn run(&self, input: &RegisterInput) -> Result<RegisterOutput, RegisterError> {
         let mut sysdb = input.sysdb.clone();
         let mut log = input.log.clone();
         let result = sysdb
@@ -142,18 +142,15 @@ mod tests {
     use super::*;
     use crate::log::log::InMemoryLog;
     use crate::sysdb::test_sysdb::TestSysDb;
-    use crate::types::Collection;
-    use crate::types::Segment;
-    use crate::types::SegmentScope;
-    use crate::types::SegmentType;
+    use chroma_types::{Collection, Segment, SegmentScope, SegmentType};
     use std::collections::HashMap;
     use std::str::FromStr;
     use uuid::Uuid;
 
     #[tokio::test]
     async fn test_register_operator() {
-        let mut sysdb = Box::new(TestSysDb::new());
-        let mut log = Box::new(InMemoryLog::new());
+        let mut sysdb = Box::new(SysDb::Test(TestSysDb::new()));
+        let mut log = Box::new(Log::InMemory(InMemoryLog::new()));
         let collection_version = 0;
         let collection_uuid_1 = Uuid::from_str("00000000-0000-0000-0000-000000000001").unwrap();
         let tenant_1 = "tenant_1".to_string();
@@ -180,8 +177,14 @@ mod tests {
             log_position: 0,
             version: collection_version,
         };
-        sysdb.add_collection(collection_1);
-        sysdb.add_collection(collection_2);
+
+        match *sysdb {
+            SysDb::Test(ref mut sysdb) => {
+                sysdb.add_collection(collection_1);
+                sysdb.add_collection(collection_2);
+            }
+            _ => panic!("Invalid sysdb type"),
+        }
 
         let mut file_path_1 = HashMap::new();
         file_path_1.insert("hnsw".to_string(), vec!["path_1".to_string()]);
@@ -191,7 +194,7 @@ mod tests {
             id: segment_id_1.clone(),
             r#type: SegmentType::HnswDistributed,
             scope: SegmentScope::VECTOR,
-            collection: Some(collection_uuid_1),
+            collection: collection_uuid_1,
             metadata: None,
             file_path: file_path_1.clone(),
         };
@@ -203,12 +206,17 @@ mod tests {
             id: segment_id_2.clone(),
             r#type: SegmentType::HnswDistributed,
             scope: SegmentScope::VECTOR,
-            collection: Some(collection_uuid_2),
+            collection: collection_uuid_2,
             metadata: None,
             file_path: file_path_2.clone(),
         };
-        sysdb.add_segment(segment_1);
-        sysdb.add_segment(segment_2);
+        match *sysdb {
+            SysDb::Test(ref mut sysdb) => {
+                sysdb.add_segment(segment_1);
+                sysdb.add_segment(segment_2);
+            }
+            _ => panic!("Invalid sysdb type"),
+        }
 
         let mut file_path_3 = HashMap::new();
         file_path_3.insert("hnsw".to_string(), vec!["path_3".to_string()]);
@@ -261,9 +269,20 @@ mod tests {
         let collection = collection[0].clone();
         assert_eq!(collection.log_position, log_position);
 
-        let segments = sysdb.get_segments(None, None, None, None).await;
-        assert!(segments.is_ok());
-        let segments = segments.unwrap();
+        let collection_1_segments = sysdb
+            .get_segments(None, None, None, collection_uuid_1)
+            .await
+            .unwrap();
+        let collection_2_segments = sysdb
+            .get_segments(None, None, None, collection_uuid_2)
+            .await
+            .unwrap();
+
+        let segments = collection_1_segments
+            .iter()
+            .chain(collection_2_segments.iter())
+            .collect::<Vec<&Segment>>();
+
         assert_eq!(segments.len(), 2);
         let segment_1 = segments.iter().find(|s| s.id == segment_id_1).unwrap();
         assert_eq!(segment_1.file_path, file_path_3);

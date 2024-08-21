@@ -1,13 +1,11 @@
 use std::{fmt::Debug, sync::RwLock};
 
 use super::config::MemberlistProviderConfig;
-use crate::system::Receiver;
-use crate::{
-    config::Configurable,
-    errors::{ChromaError, ErrorCodes},
-    system::{Component, ComponentContext, Handler, StreamHandler},
-};
+use crate::system::ReceiverForMessage;
+use crate::system::{Component, ComponentContext, Handler, StreamHandler};
 use async_trait::async_trait;
+use chroma_config::Configurable;
+use chroma_error::{ChromaError, ErrorCodes};
 use futures::StreamExt;
 use kube::runtime::watcher::Config;
 use kube::{
@@ -26,7 +24,7 @@ pub(crate) type Memberlist = Vec<String>;
 pub(crate) trait MemberlistProvider:
     Component + Configurable<MemberlistProviderConfig>
 {
-    fn subscribe(&mut self, receiver: Box<dyn Receiver<Memberlist> + Send>) -> ();
+    fn subscribe(&mut self, receiver: Box<dyn ReceiverForMessage<Memberlist> + Send>) -> ();
 }
 
 /* =========== CRD ============== */
@@ -45,7 +43,7 @@ pub(crate) struct MemberListCrd {
 // Define the structure for items in the members array
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct Member {
-    pub(crate) url: String,
+    pub(crate) member_id: String,
 }
 
 /* =========== CR Provider ============== */
@@ -56,7 +54,7 @@ pub(crate) struct CustomResourceMemberlistProvider {
     memberlist_cr_client: Api<MemberListKubeResource>,
     queue_size: usize,
     current_memberlist: RwLock<Memberlist>,
-    subscribers: Vec<Box<dyn Receiver<Memberlist> + Send>>,
+    subscribers: Vec<Box<dyn ReceiverForMessage<Memberlist> + Send>>,
 }
 
 impl Debug for CustomResourceMemberlistProvider {
@@ -76,7 +74,7 @@ pub(crate) enum CustomResourceMemberlistProviderConfigurationError {
 }
 
 impl ChromaError for CustomResourceMemberlistProviderConfigurationError {
-    fn code(&self) -> crate::errors::ErrorCodes {
+    fn code(&self) -> ErrorCodes {
         match self {
             CustomResourceMemberlistProviderConfigurationError::FailedToLoadKubeClient(_e) => {
                 ErrorCodes::Internal
@@ -182,6 +180,10 @@ impl CustomResourceMemberlistProvider {
 
 #[async_trait]
 impl Component for CustomResourceMemberlistProvider {
+    fn get_name() -> &'static str {
+        "Custom resource member list provider"
+    }
+
     fn queue_size(&self) -> usize {
         self.queue_size
     }
@@ -193,6 +195,8 @@ impl Component for CustomResourceMemberlistProvider {
 
 #[async_trait]
 impl Handler<Option<MemberListKubeResource>> for CustomResourceMemberlistProvider {
+    type Result = ();
+
     async fn handle(
         &mut self,
         event: Option<MemberListKubeResource>,
@@ -214,7 +218,7 @@ impl Handler<Option<MemberListKubeResource>> for CustomResourceMemberlistProvide
                 let memberlist = memberlist.spec.members;
                 let memberlist = memberlist
                     .iter()
-                    .map(|member| member.url.clone())
+                    .map(|member| member.member_id.clone())
                     .collect::<Vec<String>>();
                 {
                     let curr_memberlist_handle = self.current_memberlist.write();
@@ -241,7 +245,7 @@ impl StreamHandler<Option<MemberListKubeResource>> for CustomResourceMemberlistP
 
 #[async_trait]
 impl MemberlistProvider for CustomResourceMemberlistProvider {
-    fn subscribe(&mut self, sender: Box<dyn Receiver<Memberlist> + Send>) -> () {
+    fn subscribe(&mut self, sender: Box<dyn ReceiverForMessage<Memberlist> + Send>) -> () {
         self.subscribers.push(sender);
     }
 }

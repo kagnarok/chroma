@@ -1,21 +1,16 @@
-use crate::sysdb::sysdb::FlushCompactionError;
-use crate::sysdb::sysdb::GetCollectionsError;
-use crate::sysdb::sysdb::GetSegmentsError;
-use crate::sysdb::sysdb::SysDb;
-use crate::types::Collection;
-use crate::types::FlushCompactionResponse;
-use crate::types::Segment;
-use crate::types::SegmentFlushInfo;
-use crate::types::SegmentScope;
-use crate::types::SegmentType;
-use crate::types::Tenant;
-use async_trait::async_trait;
+use chroma_types::{
+    Collection, FlushCompactionResponse, Segment, SegmentFlushInfo, SegmentScope, SegmentType,
+    Tenant,
+};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use super::sysdb::FlushCompactionError;
+use super::sysdb::GetCollectionsError;
 use super::sysdb::GetLastCompactionTimeError;
+use super::sysdb::GetSegmentsError;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TestSysDb {
@@ -88,36 +83,26 @@ impl TestSysDb {
         id: Option<Uuid>,
         r#type: Option<String>,
         scope: Option<SegmentScope>,
-        collection: Option<Uuid>,
+        collection: Uuid,
     ) -> bool {
         if id.is_some() && id.unwrap() != segment.id {
             return false;
         }
-        if r#type.is_some() {
-            match r#type.unwrap().as_str() {
-                "hnsw" => {
-                    if segment.r#type != SegmentType::HnswDistributed {
-                        return false;
-                    }
-                }
-                _ => return false,
-            }
+        if let Some(r#type) = r#type {
+            return segment.r#type == SegmentType::try_from(r#type.as_str()).unwrap();
         }
         if scope.is_some() && scope.unwrap() != segment.scope {
             return false;
         }
-        if collection.is_some()
-            && (segment.collection.is_none() || collection.unwrap() != segment.collection.unwrap())
-        {
+        if collection != segment.collection {
             return false;
         }
         true
     }
 }
 
-#[async_trait]
-impl SysDb for TestSysDb {
-    async fn get_collections(
+impl TestSysDb {
+    pub(crate) async fn get_collections(
         &mut self,
         collection_id: Option<Uuid>,
         name: Option<String>,
@@ -141,12 +126,12 @@ impl SysDb for TestSysDb {
         Ok(collections)
     }
 
-    async fn get_segments(
+    pub(crate) async fn get_segments(
         &mut self,
         id: Option<Uuid>,
         r#type: Option<String>,
         scope: Option<SegmentScope>,
-        collection: Option<Uuid>,
+        collection: Uuid,
     ) -> Result<Vec<Segment>, GetSegmentsError> {
         let inner = self.inner.lock();
         let mut segments = Vec::new();
@@ -160,7 +145,7 @@ impl SysDb for TestSysDb {
         Ok(segments)
     }
 
-    async fn get_last_compaction_time(
+    pub(crate) async fn get_last_compaction_time(
         &mut self,
         tenant_ids: Vec<String>,
     ) -> Result<Vec<Tenant>, GetLastCompactionTimeError> {
@@ -182,7 +167,7 @@ impl SysDb for TestSysDb {
         Ok(tenants)
     }
 
-    async fn flush_compaction(
+    pub(crate) async fn flush_compaction(
         &mut self,
         tenant_id: String,
         collection_id: Uuid,

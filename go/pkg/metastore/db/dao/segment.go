@@ -48,16 +48,19 @@ func (s *segmentDb) Insert(in *dbmodel.Segment) error {
 		return err
 	}
 	return nil
-
-	return nil
 }
 
 func (s *segmentDb) GetSegments(id types.UniqueID, segmentType *string, scope *string, collectionID types.UniqueID) ([]*dbmodel.SegmentAndMetadata, error) {
+	if collectionID == types.NilUniqueID() {
+		return nil, common.ErrMissingCollectionID
+	}
+
 	var segments []*dbmodel.SegmentAndMetadata
 
 	query := s.db.Table("segments").
-		Select("segments.id, segments.collection_id, segments.type, segments.scope, segments.file_paths, segment_metadata.key, segment_metadata.str_value, segment_metadata.int_value, segment_metadata.float_value").
+		Select("segments.id, segments.collection_id, segments.type, segments.scope, segments.file_paths, segment_metadata.key, segment_metadata.str_value, segment_metadata.int_value, segment_metadata.float_value, segment_metadata.bool_value").
 		Joins("LEFT JOIN segment_metadata ON segments.id = segment_metadata.segment_id").
+		Where("segments.collection_id = ?", collectionID.String()).
 		Order("segments.id")
 
 	if id != types.NilUniqueID() {
@@ -69,13 +72,25 @@ func (s *segmentDb) GetSegments(id types.UniqueID, segmentType *string, scope *s
 	if scope != nil {
 		query = query.Where("scope = ?", scope)
 	}
-	if collectionID != types.NilUniqueID() {
-		query = query.Where("collection_id = ?", collectionID.String())
+
+	if query.Error != nil {
+		log.Error("get segments failed", zap.Error(query.Error))
+		return nil, query.Error
 	}
 
 	rows, err := query.Rows()
 	if err != nil {
-		log.Error("get segments failed", zap.String("segmentID", id.String()), zap.String("segmentType", *segmentType), zap.String("scope", *scope), zap.Error(err))
+		segmentTypeStr := "nil"
+		scopeStr := "nil"
+
+		if segmentType != nil {
+			segmentTypeStr = *segmentType
+		}
+		if scope != nil {
+			scopeStr = *scope
+		}
+
+		log.Error("get segments failed", zap.String("segmentID", id.String()), zap.String("segmentType", segmentTypeStr), zap.String("scope", scopeStr), zap.Error(err))
 		return nil, err
 	}
 	defer rows.Close()
@@ -95,9 +110,10 @@ func (s *segmentDb) GetSegments(id types.UniqueID, segmentType *string, scope *s
 			strValue      sql.NullString
 			intValue      sql.NullInt64
 			floatValue    sql.NullFloat64
+			boolValue     sql.NullBool
 		)
 
-		err := rows.Scan(&segmentID, &collectionID, &segmentType, &scope, &filePathsJson, &key, &strValue, &intValue, &floatValue)
+		err := rows.Scan(&segmentID, &collectionID, &segmentType, &scope, &filePathsJson, &key, &strValue, &intValue, &floatValue, &boolValue)
 		if err != nil {
 			log.Error("scan segment failed", zap.Error(err))
 		}
@@ -155,6 +171,12 @@ func (s *segmentDb) GetSegments(id types.UniqueID, segmentType *string, scope *s
 			segmentMetadata.FloatValue = &floatValue.Float64
 		} else {
 			segmentMetadata.FloatValue = nil
+		}
+
+		if boolValue.Valid {
+			segmentMetadata.BoolValue = &boolValue.Bool
+		} else {
+			segmentMetadata.BoolValue = nil
 		}
 
 		metadata = append(metadata, segmentMetadata)

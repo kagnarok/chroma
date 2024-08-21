@@ -37,8 +37,9 @@ pub(crate) fn init_otel_tracing(service_name: &String, otel_endpoint: &String) {
     let stdout_layer =
         BunyanFormattingLayer::new(service_name.clone().to_string(), std::io::stdout)
             .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
-    // global filter layer. Don't filter anything at global layer.
-    let global_layer = EnvFilter::new("TRACE");
+    // global filter layer. Don't filter anything at global layer for this crate. And disable
+    // for every other library.
+    let global_layer = EnvFilter::new("none,worker=trace");
     // Create subscriber.
     let subscriber = tracing_subscriber::registry()
         .with(global_layer)
@@ -48,4 +49,28 @@ pub(crate) fn init_otel_tracing(service_name: &String, otel_endpoint: &String) {
     tracing::subscriber::set_global_default(subscriber)
         .expect("Set global default subscriber failed");
     println!("Set global subscriber for {}", service_name);
+
+    // Add panics to tracing
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let payload = panic_info.payload();
+
+        #[allow(clippy::manual_map)]
+        let payload = if let Some(s) = payload.downcast_ref::<&str>() {
+            Some(&**s)
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            Some(s.as_str())
+        } else {
+            None
+        };
+
+        tracing::error!(
+            panic.payload = payload,
+            panic.location = panic_info.location().map(|l| l.to_string()),
+            panic.backtrace = tracing::field::display(std::backtrace::Backtrace::capture()),
+            "A panic occurred"
+        );
+
+        prev_hook(panic_info);
+    }));
 }

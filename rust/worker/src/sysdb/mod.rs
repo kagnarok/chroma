@@ -3,15 +3,15 @@ pub(crate) mod sysdb;
 pub(crate) mod test_sysdb;
 
 use self::config::SysDbConfig;
-use crate::config::Configurable;
-use crate::errors::ChromaError;
+use chroma_config::Configurable;
+use chroma_error::ChromaError;
 
 pub(crate) async fn from_config(
     config: &SysDbConfig,
-) -> Result<Box<dyn sysdb::SysDb>, Box<dyn ChromaError>> {
+) -> Result<Box<sysdb::SysDb>, Box<dyn ChromaError>> {
     match &config {
-        crate::sysdb::config::SysDbConfig::Grpc(_) => {
-            Ok(Box::new(sysdb::GrpcSysDb::try_from_config(config).await?))
-        }
+        crate::sysdb::config::SysDbConfig::Grpc(_) => Ok(Box::new(sysdb::SysDb::Grpc(
+            sysdb::GrpcSysDb::try_from_config(config).await?,
+        ))),
     }
 }

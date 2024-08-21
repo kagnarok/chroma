@@ -17,13 +17,13 @@ import (
 type ICoordinator interface {
 	common.Component
 	ResetState(ctx context.Context) error
-	CreateCollection(ctx context.Context, createCollection *model.CreateCollection) (*model.Collection, error)
+	CreateCollection(ctx context.Context, createCollection *model.CreateCollection) (*model.Collection, bool, error)
 	GetCollections(ctx context.Context, collectionID types.UniqueID, collectionName *string, tenantID string, dataName string, limit *int32, offset *int32) ([]*model.Collection, error)
 	DeleteCollection(ctx context.Context, deleteCollection *model.DeleteCollection) error
 	UpdateCollection(ctx context.Context, updateCollection *model.UpdateCollection) (*model.Collection, error)
 	CreateSegment(ctx context.Context, createSegment *model.CreateSegment) error
 	GetSegments(ctx context.Context, segmentID types.UniqueID, segmentType *string, scope *string, collectionID types.UniqueID) ([]*model.Segment, error)
-	DeleteSegment(ctx context.Context, segmentID types.UniqueID) error
+	DeleteSegment(ctx context.Context, segmentID types.UniqueID, collectionID types.UniqueID) error
 	UpdateSegment(ctx context.Context, updateSegment *model.UpdateSegment) (*model.Segment, error)
 	CreateDatabase(ctx context.Context, createDatabase *model.CreateDatabase) (*model.Database, error)
 	GetDatabase(ctx context.Context, getDatabase *model.GetDatabase) (*model.Database, error)
@@ -70,13 +70,13 @@ func (s *Coordinator) GetTenant(ctx context.Context, getTenant *model.GetTenant)
 	return tenant, nil
 }
 
-func (s *Coordinator) CreateCollection(ctx context.Context, createCollection *model.CreateCollection) (*model.Collection, error) {
+func (s *Coordinator) CreateCollection(ctx context.Context, createCollection *model.CreateCollection) (*model.Collection, bool, error) {
 	log.Info("create collection", zap.Any("createCollection", createCollection))
-	collection, err := s.catalog.CreateCollection(ctx, createCollection, createCollection.Ts)
+	collection, created, err := s.catalog.CreateCollection(ctx, createCollection, createCollection.Ts)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return collection, nil
+	return collection, created, nil
 }
 
 func (s *Coordinator) GetCollections(ctx context.Context, collectionID types.UniqueID, collectionName *string, tenantID string, databaseName string, limit *int32, offset *int32) ([]*model.Collection, error) {
@@ -106,8 +106,8 @@ func (s *Coordinator) GetSegments(ctx context.Context, segmentID types.UniqueID,
 	return s.catalog.GetSegments(ctx, segmentID, segmentType, scope, collectionID)
 }
 
-func (s *Coordinator) DeleteSegment(ctx context.Context, segmentID types.UniqueID) error {
-	return s.catalog.DeleteSegment(ctx, segmentID)
+func (s *Coordinator) DeleteSegment(ctx context.Context, segmentID types.UniqueID, collectionID types.UniqueID) error {
+	return s.catalog.DeleteSegment(ctx, segmentID, collectionID)
 }
 
 func (s *Coordinator) UpdateSegment(ctx context.Context, updateSegment *model.UpdateSegment) (*model.Segment, error) {
