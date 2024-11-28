@@ -2,7 +2,6 @@ package memberlist_manager
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/chroma-core/chroma/go/pkg/common"
@@ -60,7 +59,7 @@ func (m *MemberlistManager) reconcileMemberlist(updates map[string]bool) {
 		log.Error("Error while getting memberlist", zap.Error(err))
 		return
 	}
-	log.Info("Old Memberlist", zap.Any("memberlist", memberlist))
+	log.Debug("Old Memberlist", zap.Any("memberlist", memberlist))
 	newMemberlist, err := m.nodeWatcher.ListReadyMembers()
 	if err != nil {
 		log.Error("Error while getting ready members", zap.Error(err))
@@ -74,7 +73,7 @@ func (m *MemberlistManager) reconcileMemberlist(updates map[string]bool) {
 			return
 		}
 	} else {
-		log.Info("Memberlist has not changed")
+		log.Debug("Memberlist has not changed")
 	}
 	for key := range updates {
 		m.workqueue.Done(key)
@@ -96,7 +95,7 @@ func (m *MemberlistManager) run() {
 				break
 			}
 			key, ok := interface_key.(string)
-			log.Info("Reconciling memberlist", zap.String("key", key))
+			log.Debug("Reconciling memberlist", zap.String("key", key))
 			if !ok {
 				log.Error("Error while asserting workqueue key to string")
 				m.workqueue.Done(key)
@@ -147,14 +146,12 @@ func (m *MemberlistManager) getOldMemberlist() (Memberlist, *string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if memberlist == nil {
-		return nil, nil, errors.New("Memberlist recieved is nil")
-	}
-	return *memberlist, &resourceVersion, nil
+
+	return memberlist, &resourceVersion, nil
 }
 
 func (m *MemberlistManager) updateMemberlist(memberlist Memberlist, resourceVersion string) error {
-	return m.memberlistStore.UpdateMemberlist(context.Background(), &memberlist, resourceVersion)
+	return m.memberlistStore.UpdateMemberlist(context.Background(), memberlist, resourceVersion)
 }
 
 func (m *MemberlistManager) SetReconcileInterval(interval time.Duration) {

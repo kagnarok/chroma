@@ -11,6 +11,7 @@
 use super::config::StorageConfig;
 use super::stream::ByteStreamItem;
 use super::stream::S3ByteStream;
+use super::StorageConfigError;
 use crate::GetError;
 use async_trait::async_trait;
 use aws_config::retry::RetryConfig;
@@ -18,6 +19,7 @@ use aws_config::timeout::TimeoutConfigBuilder;
 use aws_sdk_s3;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::create_bucket::CreateBucketError;
+use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::CompletedMultipartUpload;
 use aws_sdk_s3::types::CompletedPart;
@@ -27,6 +29,7 @@ use chroma_config::Configurable;
 use chroma_error::ChromaError;
 use chroma_error::ErrorCodes;
 use futures::future::BoxFuture;
+use futures::stream;
 use futures::FutureExt;
 use futures::Stream;
 use futures::StreamExt;
@@ -35,6 +38,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tracing::Instrument;
 use tracing::Span;
 
@@ -43,6 +47,7 @@ pub struct S3Storage {
     pub(super) bucket: String,
     pub(super) client: aws_sdk_s3::Client,
     pub(super) upload_part_size_bytes: usize,
+    pub(super) download_part_size_bytes: usize,
 }
 
 #[derive(Error, Debug)]
@@ -76,12 +81,18 @@ impl ChromaError for S3GetError {
 }
 
 impl S3Storage {
-    fn new(bucket: &str, client: aws_sdk_s3::Client, upload_part_size_bytes: usize) -> S3Storage {
-        return S3Storage {
+    fn new(
+        bucket: &str,
+        client: aws_sdk_s3::Client,
+        upload_part_size_bytes: usize,
+        download_part_size_bytes: usize,
+    ) -> S3Storage {
+        S3Storage {
             bucket: bucket.to_string(),
             client,
             upload_part_size_bytes,
-        };
+            download_part_size_bytes,
+        }
     }
 
     pub(super) async fn create_bucket(&self) -> Result<(), String> {
@@ -97,32 +108,32 @@ impl S3Storage {
         match res {
             Ok(_) => {
                 tracing::info!("created bucket {}", self.bucket);
-                return Ok(());
+                Ok(())
             }
             Err(e) => match e {
                 SdkError::ServiceError(err) => match err.into_err() {
                     CreateBucketError::BucketAlreadyExists(msg) => {
                         tracing::error!("bucket already exists: {}", msg);
-                        return Ok(());
+                        Ok(())
                     }
                     CreateBucketError::BucketAlreadyOwnedByYou(msg) => {
                         tracing::error!("bucket already owned by you: {}", msg);
-                        return Ok(());
+                        Ok(())
                     }
                     e => {
                         tracing::error!("Error creating bucket: {}", e.to_string());
-                        return Err::<(), String>(e.to_string());
+                        Err::<(), String>(e.to_string())
                     }
                 },
                 _ => {
                     tracing::error!("Error creating bucket: {}", e);
-                    return Err::<(), String>(e.to_string());
+                    Err::<(), String>(e.to_string())
                 }
             },
         }
     }
 
-    pub(super) async fn get_stream(
+    async fn get_stream(
         &self,
         key: &str,
     ) -> Result<Box<dyn Stream<Item = ByteStreamItem> + Unpin + Send>, S3GetError> {
@@ -136,7 +147,7 @@ impl S3Storage {
         match res {
             Ok(res) => {
                 let byte_stream = res.body;
-                return Ok(Box::new(S3ByteStream::new(byte_stream)));
+                Ok(Box::new(S3ByteStream::new(byte_stream)))
             }
             Err(e) => {
                 tracing::error!("error: {}", e);
@@ -146,27 +157,142 @@ impl S3Storage {
                         match inner {
                             aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(msg) => {
                                  tracing::error!("no such key: {}", msg);
-                                return Err(S3GetError::NoSuchKey(msg.to_string()));
+                                Err(S3GetError::NoSuchKey(msg.to_string()))
                             }
                             aws_sdk_s3::operation::get_object::GetObjectError::InvalidObjectState(msg) => {
                                  tracing::error!("invalid object state: {}", msg);
-                                return Err(S3GetError::S3GetError(msg.to_string()));
-                            }
-                            aws_sdk_s3::operation::get_object::GetObjectError::Unhandled(_) =>  {
-                                 tracing::error!("unhandled error");
-                                return Err(S3GetError::S3GetError("unhandled error".to_string()));
+                                Err(S3GetError::S3GetError(msg.to_string()))
                             }
                             _ => {
                                  tracing::error!("error: {}", inner.to_string());
-                                return Err(S3GetError::S3GetError(inner.to_string()));
+                                Err(S3GetError::S3GetError(inner.to_string()))
                             }
-                        };
+                        }
                     }
-                    _ => {}
+                    _ => Err(S3GetError::S3GetError(e.to_string())),
                 }
-                return Err(S3GetError::S3GetError(e.to_string()));
             }
         }
+    }
+
+    pub(super) async fn get_key_ranges(
+        &self,
+        key: &str,
+    ) -> Result<(i64, Vec<(i64, i64)>), S3GetError> {
+        let part_size = self.download_part_size_bytes as i64;
+        let head_res = self
+            .client
+            .head_object()
+            .bucket(self.bucket.clone())
+            .key(key)
+            .send()
+            .await;
+        let content_length = match head_res {
+            Ok(res) => match res.content_length {
+                Some(len) => len,
+                None => {
+                    return Err(S3GetError::S3GetError("No content length".to_string()));
+                }
+            },
+            Err(e) => {
+                return Err(S3GetError::S3GetError(e.to_string()));
+            }
+        };
+        // Round up.
+        let num_parts = (content_length as f64 / part_size as f64).ceil() as i64;
+        let mut ranges = Vec::new();
+        for i in 0..num_parts {
+            let start = i * part_size;
+            let end = if i == num_parts - 1 {
+                content_length - 1
+            } else {
+                (i + 1) * part_size - 1
+            };
+            ranges.push((start, end));
+        }
+        Ok((content_length, ranges))
+    }
+
+    pub(super) async fn fetch_range(
+        &self,
+        key: String,
+        range_str: String,
+    ) -> Result<GetObjectOutput, S3GetError> {
+        let res = self
+            .client
+            .get_object()
+            .bucket(self.bucket.clone())
+            .key(key)
+            .range(range_str)
+            .send()
+            .await;
+        match res {
+            Ok(output) => Ok(output),
+            Err(e) => {
+                tracing::error!("Error fetching range: {:?}", e);
+                match e {
+                    SdkError::ServiceError(err) => {
+                        let inner = err.into_err();
+                        match inner {
+                            aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(msg) => {
+                                Err(S3GetError::NoSuchKey(msg.to_string()))
+                            }
+                            aws_sdk_s3::operation::get_object::GetObjectError::InvalidObjectState(msg) => {
+                                Err(S3GetError::S3GetError(msg.to_string()))
+                            }
+                            _ => {
+                                Err(S3GetError::S3GetError(inner.to_string()))
+                            }
+                        }
+                    }
+                    _ => Err(S3GetError::S3GetError(e.to_string())),
+                }
+            }
+        }
+    }
+
+    pub(super) async fn get_parallel(&self, key: &str) -> Result<Arc<Vec<u8>>, S3GetError> {
+        let (content_length, ranges) = self.get_key_ranges(key).await?;
+
+        // .buffer_unordered() below will hang if the range is empty (https://github.com/rust-lang/futures-rs/issues/2740), so we short-circuit here
+        if content_length == 0 {
+            return Ok(Arc::new(Vec::new()));
+        }
+
+        let part_size = self.download_part_size_bytes;
+        let mut output_buffer: Vec<u8> = vec![0; content_length as usize];
+        let mut output_slices = output_buffer.chunks_mut(part_size).collect::<Vec<_>>();
+        let range_and_output_slices = ranges.iter().zip(output_slices.drain(..));
+        let mut get_futures = Vec::new();
+        let num_parts = range_and_output_slices.len();
+        for (range, output_slice) in range_and_output_slices {
+            let range_str = format!("bytes={}-{}", range.0, range.1);
+            let fut = self
+                .fetch_range(key.to_string(), range_str)
+                .then(|res| async move {
+                    match res {
+                        Ok(res) => {
+                            let body = res.body;
+                            let mut reader = body.into_async_read();
+                            match reader.read_exact(output_slice).await {
+                                Ok(_) => Ok(()),
+                                Err(e) => {
+                                    tracing::error!("Error reading range: {:?}", e);
+                                    Err(S3GetError::ByteStreamError(e.to_string()))
+                                }
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                });
+            get_futures.push(fut);
+        }
+        // Await all futures and return the result.
+        let _ = stream::iter(get_futures)
+            .buffer_unordered(num_parts)
+            .collect::<Vec<_>>()
+            .await;
+        Ok(Arc::new(output_buffer))
     }
 
     pub async fn get(&self, key: &str) -> Result<Arc<Vec<u8>>, S3GetError> {
@@ -186,6 +312,9 @@ impl S3Storage {
                         Err(err) => {
                             tracing::error!("Error reading from S3: {}", err);
                             match err {
+                                GetError::ObjectStoreError(e) => {
+                                    return Err(S3GetError::S3GetError(e.to_string()));
+                                }
                                 GetError::S3Error(e) => {
                                     return Err(e);
                                 }
@@ -367,23 +496,6 @@ impl S3Storage {
     }
 }
 
-#[derive(Error, Debug)]
-pub enum StorageConfigError {
-    #[error("Invalid storage config")]
-    InvalidStorageConfig,
-    #[error("Failed to create bucket: {0}")]
-    FailedToCreateBucket(String),
-}
-
-impl ChromaError for StorageConfigError {
-    fn code(&self) -> ErrorCodes {
-        match self {
-            StorageConfigError::InvalidStorageConfig => ErrorCodes::InvalidArgument,
-            StorageConfigError::FailedToCreateBucket(_) => ErrorCodes::Internal,
-        }
-    }
-}
-
 #[async_trait]
 impl Configurable<StorageConfig> for S3Storage {
     async fn try_from_config(config: &StorageConfig) -> Result<Self, Box<dyn ChromaError>> {
@@ -431,27 +543,26 @@ impl Configurable<StorageConfig> for S3Storage {
                         aws_sdk_s3::Client::new(&config)
                     }
                 };
-                let storage =
-                    S3Storage::new(&s3_config.bucket, client, s3_config.upload_part_size_bytes);
+                let storage = S3Storage::new(
+                    &s3_config.bucket,
+                    client,
+                    s3_config.upload_part_size_bytes,
+                    s3_config.download_part_size_bytes,
+                );
                 // for minio we create the bucket since it is only used for testing
-                match &s3_config.credentials {
-                    super::config::S3CredentialsConfig::Minio => {
-                        let res = storage.create_bucket().await;
-                        match res {
-                            Ok(_) => {}
-                            Err(e) => {
-                                return Err(Box::new(StorageConfigError::FailedToCreateBucket(e)));
-                            }
+
+                if let super::config::S3CredentialsConfig::Minio = &s3_config.credentials {
+                    let res = storage.create_bucket().await;
+                    match res {
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Err(Box::new(StorageConfigError::FailedToCreateBucket(e)));
                         }
                     }
-                    _ => {}
                 }
-
-                return Ok(storage);
+                Ok(storage)
             }
-            _ => {
-                return Err(Box::new(StorageConfigError::InvalidStorageConfig));
-            }
+            _ => Err(Box::new(StorageConfigError::InvalidStorageConfig)),
         }
     }
 }
@@ -459,10 +570,9 @@ impl Configurable<StorageConfig> for S3Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
-    use rand::{Rng, SeedableRng};
+    use rand::{distributions::Alphanumeric, Rng, SeedableRng};
     use std::io::Write;
-    use tempfile::{tempdir, NamedTempFile};
+    use tempfile::NamedTempFile;
 
     fn get_s3_client() -> aws_sdk_s3::Client {
         // Set up credentials assuming minio is running locally
@@ -487,14 +597,15 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(CHROMA_KUBERNETES_INTEGRATION)]
-    async fn test_put_get_key() {
+    // Naming this "test_k8s_integration_" means that the Tilt stack is required. See rust/worker/README.md.
+    async fn test_k8s_integration_put_get_key() {
         let client = get_s3_client();
 
         let storage = S3Storage {
-            bucket: "test".to_string(),
+            bucket: format!("test-{}", rand::thread_rng().gen::<u64>()),
             client,
             upload_part_size_bytes: 1024 * 1024 * 8,
+            download_part_size_bytes: 1024 * 1024 * 8,
         };
         storage.create_bucket().await.unwrap();
 
@@ -504,31 +615,23 @@ mod tests {
             .await
             .unwrap();
 
-        let mut stream = storage.get("test").await.unwrap();
-
-        let mut buf = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(data) => {
-                    buf.extend_from_slice(&data);
-                }
-                Err(e) => {
-                    panic!("Error reading stream: {}", e);
-                }
-            }
-        }
-
-        let buf = String::from_utf8(buf).unwrap();
+        let buf = storage.get("test").await.unwrap();
+        let buf = String::from_utf8(buf.to_vec()).unwrap();
         assert_eq!(buf, test_data);
     }
 
-    async fn test_put_file(file_size: usize, upload_part_size_bytes: usize) {
+    async fn test_put_file(
+        file_size: usize,
+        upload_part_size_bytes: usize,
+        download_part_size_bytes: usize,
+    ) {
         let client = get_s3_client();
 
         let storage = S3Storage {
-            bucket: "test".to_string(),
+            bucket: format!("test-{}", rand::thread_rng().gen::<u64>()),
             client,
             upload_part_size_bytes,
+            download_part_size_bytes,
         };
         storage.create_bucket().await.unwrap();
 
@@ -546,46 +649,102 @@ mod tests {
         }
 
         storage
-            .put_file("test", &temp_file.path().to_str().unwrap())
+            .put_file("test", temp_file.path().to_str().unwrap())
             .await
             .unwrap();
 
-        let mut stream = storage.get_stream("test").await.unwrap();
-
-        let mut buf = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(data) => {
-                    buf.extend_from_slice(&data);
-                }
-                Err(e) => {
-                    panic!("Error reading stream: {}", e);
-                }
-            }
-        }
-
+        let buf = storage.get("test").await.unwrap();
         let file_contents = std::fs::read(temp_file.path()).unwrap();
-        assert_eq!(buf, file_contents);
+        assert_eq!(buf, file_contents.into());
+    }
+
+    async fn test_multipart_get_for_size(value_size: usize) {
+        let client = get_s3_client();
+
+        let storage = S3Storage {
+            bucket: format!("test-{}", rand::thread_rng().gen::<u64>()),
+            client,
+            upload_part_size_bytes: 1024 * 1024 * 8,
+            download_part_size_bytes: 1024 * 1024 * 8,
+        };
+        storage.create_bucket().await.unwrap();
+
+        // Randomly generate a 16 byte utf8 string.
+        let test_data_key: String = rand::thread_rng()
+            .sample_iter(Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect();
+        // Randomly generate data of size equaling value_size.
+        let test_data_value_string: String = rand::thread_rng()
+            .sample_iter(Alphanumeric)
+            .take(value_size)
+            .map(char::from)
+            .collect();
+        storage
+            .put_bytes(
+                test_data_key.as_str(),
+                test_data_value_string.as_bytes().to_vec(),
+            )
+            .await
+            .unwrap();
+        println!(
+            "Wrote key {} with value of size {}",
+            test_data_key,
+            test_data_value_string.len()
+        );
+
+        // Parallel fetch.
+        let buf = storage.get_parallel(&test_data_key).await.unwrap();
+
+        let buf = String::from_utf8(Arc::unwrap_or_clone(buf)).unwrap();
+        assert_eq!(buf, test_data_value_string);
     }
 
     #[tokio::test]
-    #[cfg(CHROMA_KUBERNETES_INTEGRATION)]
-    async fn test_put_file_scenarios() {
+    // Naming this "test_k8s_integration_" means that the Tilt stack is required. See rust/worker/README.md.
+    async fn test_k8s_integration_put_file_scenarios() {
         let test_upload_part_size_bytes = 1024 * 1024 * 8; // 8MB
+        let test_download_part_size_bytes = 1024 * 1024 * 8; // 8MB
 
         // Under part size
-        test_put_file(1024, test_upload_part_size_bytes).await;
+        test_put_file(
+            1024,
+            test_upload_part_size_bytes,
+            test_download_part_size_bytes,
+        )
+        .await;
         // At part size
         test_put_file(
-            test_upload_part_size_bytes as usize,
             test_upload_part_size_bytes,
+            test_upload_part_size_bytes,
+            test_download_part_size_bytes,
         )
         .await;
         // Over part size
         test_put_file(
             (test_upload_part_size_bytes as f64 * 2.5) as usize,
             test_upload_part_size_bytes,
+            test_download_part_size_bytes,
         )
         .await;
+    }
+
+    #[tokio::test]
+    // Naming this "test_k8s_integration_" means that the Tilt stack is required. See rust/worker/README.md.
+    async fn test_k8s_integration_multipart_get() {
+        // At 8 MB.
+        test_multipart_get_for_size(1024 * 1024 * 8).await;
+        // At < 8 MB.
+        test_multipart_get_for_size(1024 * 1024 * 7).await;
+        // At > 8 MB.
+        test_multipart_get_for_size(1024 * 1024 * 10).await;
+        // Greater than NAC limit i.e. > 2*8 MB = 16 MB.
+        test_multipart_get_for_size(1024 * 1024 * 18).await;
+    }
+
+    #[tokio::test]
+    async fn test_k8s_integration_empty_file() {
+        test_multipart_get_for_size(0).await;
     }
 }

@@ -1,17 +1,17 @@
-use super::{Index, IndexConfig, PersistentIndex};
+use super::{Index, IndexConfig, IndexUuid, PersistentIndex};
 use chroma_error::{ChromaError, ErrorCodes};
-use chroma_types::{Metadata, MetadataValue, MetadataValueConversionError, Segment};
+use chroma_types::MetadataValueConversionError;
 use std::ffi::CString;
 use std::ffi::{c_char, c_int};
+use std::path::Path;
 use std::str::Utf8Error;
 use thiserror::Error;
 use tracing::instrument;
-use uuid::Uuid;
 
-const DEFAULT_MAX_ELEMENTS: usize = 10000;
-const DEFAULT_HNSW_M: usize = 16;
-const DEFAULT_HNSW_EF_CONSTRUCTION: usize = 100;
-const DEFAULT_HNSW_EF_SEARCH: usize = 10;
+pub const DEFAULT_MAX_ELEMENTS: usize = 10000;
+pub const DEFAULT_HNSW_M: usize = 16;
+pub const DEFAULT_HNSW_EF_CONSTRUCTION: usize = 100;
+pub const DEFAULT_HNSW_EF_SEARCH: usize = 10;
 
 // https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs
 #[repr(C)]
@@ -51,10 +51,12 @@ impl ChromaError for HnswIndexFromSegmentError {
 }
 
 impl HnswIndexConfig {
-    pub fn from_segment(
-        segment: &Segment,
-        persist_path: &std::path::Path,
-    ) -> Result<HnswIndexConfig, Box<HnswIndexFromSegmentError>> {
+    pub fn new(
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        persist_path: &Path,
+    ) -> Result<Self, Box<HnswIndexFromSegmentError>> {
         let persist_path = match persist_path.to_str() {
             Some(persist_path) => persist_path,
             None => {
@@ -63,56 +65,14 @@ impl HnswIndexConfig {
                 )))
             }
         };
-        let metadata = match &segment.metadata {
-            Some(metadata) => metadata,
-            None => {
-                // TODO: This should error, but the configuration is not stored correctly
-                // after the configuration is refactored to be always stored and doesn't rely on defaults we can fix this
-                return Ok(HnswIndexConfig {
-                    max_elements: DEFAULT_MAX_ELEMENTS,
-                    m: DEFAULT_HNSW_M,
-                    ef_construction: DEFAULT_HNSW_EF_CONSTRUCTION,
-                    ef_search: DEFAULT_HNSW_EF_SEARCH,
-                    random_seed: 0,
-                    persist_path: persist_path.to_string(),
-                });
-            }
-        };
-
-        fn get_metadata_value_as<'a, T>(
-            metadata: &'a Metadata,
-            key: &str,
-        ) -> Result<T, Box<HnswIndexFromSegmentError>>
-        where
-            T: TryFrom<&'a MetadataValue, Error = MetadataValueConversionError>,
-        {
-            let res = match metadata.get(key) {
-                Some(value) => T::try_from(value),
-                None => {
-                    return Err(Box::new(HnswIndexFromSegmentError::MissingConfig(
-                        key.to_string(),
-                    )))
-                }
-            };
-            match res {
-                Ok(value) => Ok(value),
-                Err(e) => Err(Box::new(HnswIndexFromSegmentError::MetadataValueError(e))),
-            }
-        }
-
-        let m = get_metadata_value_as::<i32>(metadata, "hnsw:M").unwrap_or(DEFAULT_HNSW_M as i32);
-        let ef_construction = get_metadata_value_as::<i32>(metadata, "hnsw:construction_ef")
-            .unwrap_or(DEFAULT_HNSW_EF_CONSTRUCTION as i32);
-        let ef_search = get_metadata_value_as::<i32>(metadata, "hnsw:search_ef")
-            .unwrap_or(DEFAULT_HNSW_EF_SEARCH as i32);
-        return Ok(HnswIndexConfig {
+        Ok(HnswIndexConfig {
             max_elements: DEFAULT_MAX_ELEMENTS,
-            m: m as usize,
-            ef_construction: ef_construction as usize,
-            ef_search: ef_search as usize,
+            m,
+            ef_construction,
+            ef_search,
             random_seed: 0,
             persist_path: persist_path.to_string(),
-        });
+        })
     }
 }
 
@@ -126,7 +86,7 @@ impl HnswIndexConfig {
 pub struct HnswIndex {
     ffi_ptr: *const IndexPtrFFI,
     dimensionality: i32,
-    pub id: Uuid,
+    pub id: IndexUuid,
 }
 
 // Make index sync, we should wrap index so that it is sync in the way we expect but for now this implements the trait
@@ -172,10 +132,10 @@ impl Index<HnswIndexConfig> for HnswIndex {
     fn init(
         index_config: &IndexConfig,
         hnsw_config: Option<&HnswIndexConfig>,
-        id: Uuid,
+        id: IndexUuid,
     ) -> Result<Self, Box<dyn ChromaError>> {
         match hnsw_config {
-            None => return Err(Box::new(HnswIndexInitError::NoConfigProvided)),
+            None => Err(Box::new(HnswIndexInitError::NoConfigProvided)),
             Some(config) => {
                 let distance_function_string: String =
                     index_config.distance_function.clone().into();
@@ -213,7 +173,7 @@ impl Index<HnswIndexConfig> for HnswIndex {
                 read_and_return_hnsw_error(ffi_ptr)?;
 
                 let hnsw_index = HnswIndex {
-                    ffi_ptr: ffi_ptr,
+                    ffi_ptr,
                     dimensionality: index_config.dimensionality,
                     id,
                 };
@@ -243,9 +203,8 @@ impl Index<HnswIndexConfig> for HnswIndex {
         let actual_k = std::cmp::min(k, self.len());
         let mut ids = vec![0usize; actual_k];
         let mut distance = vec![0.0f32; actual_k];
-        let mut total_result = actual_k;
-        unsafe {
-            total_result = knn_query(
+        let total_result = unsafe {
+            knn_query(
                 self.ffi_ptr,
                 vector.as_ptr(),
                 k,
@@ -255,15 +214,15 @@ impl Index<HnswIndexConfig> for HnswIndex {
                 allowed_ids.len(),
                 disallowed_ids.as_ptr(),
                 disallowed_ids.len(),
-            ) as usize;
-        }
+            ) as usize
+        };
         read_and_return_hnsw_error(self.ffi_ptr)?;
 
         if total_result < actual_k {
             ids.truncate(total_result);
             distance.truncate(total_result);
         }
-        return Ok((ids, distance));
+        Ok((ids, distance))
     }
 
     fn get(&self, id: usize) -> Result<Option<Vec<f32>>, Box<dyn ChromaError>> {
@@ -271,7 +230,7 @@ impl Index<HnswIndexConfig> for HnswIndex {
             let mut data: Vec<f32> = vec![0.0f32; self.dimensionality as usize];
             get_item(self.ffi_ptr, id, data.as_mut_ptr());
             read_and_return_hnsw_error(self.ffi_ptr)?;
-            return Ok(Some(data));
+            Ok(Some(data))
         }
     }
 }
@@ -287,7 +246,7 @@ impl PersistentIndex<HnswIndexConfig> for HnswIndex {
     fn load(
         path: &str,
         index_config: &IndexConfig,
-        id: Uuid,
+        id: IndexUuid,
     ) -> Result<Self, Box<dyn ChromaError>> {
         let distance_function_string: String = index_config.distance_function.clone().into();
         let space_name = match CString::new(distance_function_string) {
@@ -311,7 +270,7 @@ impl PersistentIndex<HnswIndexConfig> for HnswIndex {
         read_and_return_hnsw_error(ffi_ptr)?;
 
         let hnsw_index = HnswIndex {
-            ffi_ptr: ffi_ptr,
+            ffi_ptr,
             dimensionality: index_config.dimensionality,
             id,
         };
@@ -328,6 +287,14 @@ impl HnswIndex {
     pub fn len(&self) -> usize {
         unsafe { len(self.ffi_ptr) as usize }
         // Does not return an error
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn dimensionality(&self) -> i32 {
+        self.dimensionality
     }
 
     pub fn capacity(&self) -> usize {
@@ -425,14 +392,13 @@ pub mod test {
     use rand::seq::IteratorRandom;
     use rayon::prelude::*;
     use rayon::ThreadPoolBuilder;
-    use std::collections::HashMap;
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     const EPS: f32 = 0.00001;
 
     fn index_data_same(index: &HnswIndex, ids: &[usize], data: &[f32], dim: usize) {
-        let mut i = 0;
-        for id in ids {
+        for (i, id) in ids.iter().enumerate() {
             let actual_data = index.get(*id);
             match actual_data {
                 Ok(actual_data) => match actual_data {
@@ -447,7 +413,6 @@ pub mod test {
                 },
                 Err(_) => panic!("Did not expect error"),
             }
-            i += 1;
         }
     }
 
@@ -461,7 +426,7 @@ pub mod test {
         let index = HnswIndex::init(
             &IndexConfig {
                 dimensionality: d as i32,
-                distance_function: distance_function,
+                distance_function,
             },
             Some(&HnswIndexConfig {
                 max_elements: n,
@@ -469,9 +434,9 @@ pub mod test {
                 ef_construction: 100,
                 ef_search: 10,
                 random_seed: 0,
-                persist_path: persist_path,
+                persist_path,
             }),
-            Uuid::new_v4(),
+            IndexUuid(Uuid::new_v4()),
         );
         match index {
             Err(e) => panic!("Error initializing index: {}", e),
@@ -493,7 +458,7 @@ pub mod test {
         let index = HnswIndex::init(
             &IndexConfig {
                 dimensionality: d as i32,
-                distance_function: distance_function,
+                distance_function,
             },
             Some(&HnswIndexConfig {
                 max_elements: n,
@@ -501,9 +466,9 @@ pub mod test {
                 ef_construction: 100,
                 ef_search: 100,
                 random_seed: 0,
-                persist_path: persist_path,
+                persist_path,
             }),
-            Uuid::new_v4(),
+            IndexUuid(Uuid::new_v4()),
         );
 
         let index = match index {
@@ -542,7 +507,7 @@ pub mod test {
         let index = HnswIndex::init(
             &IndexConfig {
                 dimensionality: d as i32,
-                distance_function: distance_function,
+                distance_function,
             },
             Some(&HnswIndexConfig {
                 max_elements: n,
@@ -550,9 +515,9 @@ pub mod test {
                 ef_construction: 100,
                 ef_search: 100,
                 random_seed: 0,
-                persist_path: persist_path,
+                persist_path,
             }),
-            Uuid::new_v4(),
+            IndexUuid(Uuid::new_v4()),
         );
 
         let index = match index {
@@ -564,7 +529,7 @@ pub mod test {
         let data: Vec<f32> = utils::generate_random_data(n, d);
         let ids: Vec<usize> = (0..n).collect();
 
-        (0..n).into_iter().for_each(|i| {
+        (0..n).for_each(|i| {
             let data = &data[i * d..(i + 1) * d];
             index.add(ids[i], data).expect("Should not error");
         });
@@ -597,7 +562,7 @@ pub mod test {
         let index = HnswIndex::init(
             &IndexConfig {
                 dimensionality: d as i32,
-                distance_function: distance_function,
+                distance_function,
             },
             Some(&HnswIndexConfig {
                 max_elements: n,
@@ -605,9 +570,9 @@ pub mod test {
                 ef_construction: 100,
                 ef_search: 100,
                 random_seed: 0,
-                persist_path: persist_path,
+                persist_path,
             }),
-            Uuid::new_v4(),
+            IndexUuid(Uuid::new_v4()),
         );
 
         let index = match index {
@@ -618,7 +583,7 @@ pub mod test {
         let data: Vec<f32> = utils::generate_random_data(n, d);
         let ids: Vec<usize> = (0..n).collect();
 
-        (0..n).into_iter().for_each(|i| {
+        (0..n).for_each(|i| {
             let data = &data[i * d..(i + 1) * d];
             index.add(ids[i], data).expect("Should not error");
         });
@@ -670,7 +635,7 @@ pub mod test {
                 random_seed: 0,
                 persist_path: persist_path.clone(),
             }),
-            id,
+            IndexUuid(id),
         );
 
         let index = match index {
@@ -681,16 +646,15 @@ pub mod test {
         let data: Vec<f32> = utils::generate_random_data(n, d);
         let ids: Vec<usize> = (0..n).collect();
 
-        (0..n).into_iter().for_each(|i| {
+        (0..n).for_each(|i| {
             let data = &data[i * d..(i + 1) * d];
             index.add(ids[i], data).expect("Should not error");
         });
 
         // Persist the index
         let res = index.save();
-        match res {
-            Err(e) => panic!("Error saving index: {}", e),
-            Ok(_) => {}
+        if let Err(e) = res {
+            panic!("Error saving index: {}", e);
         }
 
         // Load the index
@@ -698,9 +662,9 @@ pub mod test {
             &persist_path,
             &IndexConfig {
                 dimensionality: d as i32,
-                distance_function: distance_function,
+                distance_function,
             },
-            id,
+            IndexUuid(id),
         );
 
         let index = match index {
@@ -709,7 +673,7 @@ pub mod test {
         };
         // TODO: This should be set by the load
         index.set_ef(100).expect("Should not error");
-        assert_eq!(index.id, id);
+        assert_eq!(index.id, IndexUuid(id));
 
         // Query the data
         let query = &data[0..d];
@@ -735,7 +699,7 @@ pub mod test {
         let index = HnswIndex::init(
             &IndexConfig {
                 dimensionality: d as i32,
-                distance_function: distance_function,
+                distance_function,
             },
             Some(&HnswIndexConfig {
                 max_elements: n,
@@ -743,9 +707,9 @@ pub mod test {
                 ef_construction: 100,
                 ef_search: 100,
                 random_seed: 0,
-                persist_path: persist_path,
+                persist_path,
             }),
-            Uuid::new_v4(),
+            IndexUuid(Uuid::new_v4()),
         );
 
         let index = match index {
@@ -756,7 +720,7 @@ pub mod test {
         let data: Vec<f32> = utils::generate_random_data(n, d);
         let ids: Vec<usize> = (0..n).collect();
 
-        (0..n).into_iter().for_each(|i| {
+        (0..n).for_each(|i| {
             let data = &data[i * d..(i + 1) * d];
             index.add(ids[i], data).expect("Should not error");
         });
@@ -780,7 +744,7 @@ pub mod test {
         let index = HnswIndex::init(
             &IndexConfig {
                 dimensionality: d as i32,
-                distance_function: distance_function,
+                distance_function,
             },
             Some(&HnswIndexConfig {
                 max_elements: n,
@@ -788,9 +752,9 @@ pub mod test {
                 ef_construction: 100,
                 ef_search: 100,
                 random_seed: 0,
-                persist_path: persist_path,
+                persist_path,
             }),
-            Uuid::new_v4(),
+            IndexUuid(Uuid::new_v4()),
         );
 
         let mut index = match index {
@@ -801,7 +765,7 @@ pub mod test {
         let data: Vec<f32> = utils::generate_random_data(2 * n, d);
         let ids: Vec<usize> = (0..2 * n).collect();
 
-        (0..n).into_iter().for_each(|i| {
+        (0..n).for_each(|i| {
             let data = &data[i * d..(i + 1) * d];
             index.add(ids[i], data).expect("Should not error");
         });
@@ -814,56 +778,10 @@ pub mod test {
         assert_eq!(index.capacity(), 2 * n);
 
         // Add another n elements from n to 2n
-        (n..2 * n).into_iter().for_each(|i| {
+        (n..2 * n).for_each(|i| {
             let data = &data[i * d..(i + 1) * d];
             index.add(ids[i], data).expect("Should not error");
         });
-    }
-
-    #[test]
-    fn parameter_defaults() {
-        let segment = Segment {
-            id: Uuid::new_v4(),
-            r#type: chroma_types::SegmentType::HnswDistributed,
-            scope: chroma_types::SegmentScope::VECTOR,
-            metadata: Some(HashMap::new()),
-            collection: Uuid::new_v4(),
-            file_path: HashMap::new(),
-        };
-
-        let persist_path = tempdir().unwrap().path().to_owned();
-        let config = HnswIndexConfig::from_segment(&segment, &persist_path)
-            .expect("Failed to create config from segment");
-
-        assert_eq!(config.max_elements, DEFAULT_MAX_ELEMENTS);
-        assert_eq!(config.m, DEFAULT_HNSW_M);
-        assert_eq!(config.ef_construction, DEFAULT_HNSW_EF_CONSTRUCTION);
-        assert_eq!(config.ef_search, DEFAULT_HNSW_EF_SEARCH);
-        assert_eq!(config.random_seed, 0);
-        assert_eq!(config.persist_path, persist_path.to_str().unwrap());
-
-        // Try partial metadata
-        let mut metadata = HashMap::new();
-        metadata.insert("hnsw:M".to_string(), MetadataValue::Int(10 as i32));
-
-        let segment = Segment {
-            id: Uuid::new_v4(),
-            r#type: chroma_types::SegmentType::HnswDistributed,
-            scope: chroma_types::SegmentScope::VECTOR,
-            metadata: Some(metadata),
-            collection: Uuid::new_v4(),
-            file_path: HashMap::new(),
-        };
-
-        let config = HnswIndexConfig::from_segment(&segment, &persist_path)
-            .expect("Failed to create config from segment");
-
-        assert_eq!(config.max_elements, DEFAULT_MAX_ELEMENTS);
-        assert_eq!(config.m, 10);
-        assert_eq!(config.ef_construction, DEFAULT_HNSW_EF_CONSTRUCTION);
-        assert_eq!(config.ef_search, DEFAULT_HNSW_EF_SEARCH);
-        assert_eq!(config.random_seed, 0);
-        assert_eq!(config.persist_path, persist_path.to_str().unwrap());
     }
 
     #[test]
@@ -876,7 +794,7 @@ pub mod test {
         let index = HnswIndex::init(
             &IndexConfig {
                 dimensionality: d as i32,
-                distance_function: distance_function,
+                distance_function,
             },
             Some(&HnswIndexConfig {
                 max_elements: n,
@@ -884,9 +802,9 @@ pub mod test {
                 ef_construction: 100,
                 ef_search: 100,
                 random_seed: 0,
-                persist_path: persist_path,
+                persist_path,
             }),
-            Uuid::new_v4(),
+            IndexUuid(Uuid::new_v4()),
         );
 
         let index = match index {
@@ -897,7 +815,7 @@ pub mod test {
         let data: Vec<f32> = utils::generate_random_data(n, d);
         let ids: Vec<usize> = (0..n).collect();
 
-        (0..n).into_iter().for_each(|i| {
+        (0..n).for_each(|i| {
             let data = &data[i * d..(i + 1) * d];
             index.add(ids[i], data).expect("Should not error");
         });

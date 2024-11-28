@@ -24,13 +24,14 @@ use crate::{
 use async_trait::async_trait;
 use chroma_blockstore::provider::BlockfileProvider;
 use chroma_error::{ChromaError, ErrorCodes};
-use chroma_types::{Chunk, Collection, GetVectorsResult, LogRecord, Segment};
+use chroma_types::{Chunk, Collection, CollectionUuid, GetVectorsResult, LogRecord, Segment};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{trace, Span};
 use uuid::Uuid;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum ExecutionState {
     Pending,
     PullLogs,
@@ -43,6 +44,8 @@ enum GetVectorsError {
     TaskSendError(#[from] ChannelError),
     #[error("System time error")]
     SystemTimeError(#[from] std::time::SystemTimeError),
+    #[error("Collection version mismatch")]
+    CollectionVersionMismatch,
 }
 
 impl ChromaError for GetVectorsError {
@@ -50,11 +53,13 @@ impl ChromaError for GetVectorsError {
         match self {
             GetVectorsError::TaskSendError(e) => e.code(),
             GetVectorsError::SystemTimeError(_) => ErrorCodes::Internal,
+            GetVectorsError::CollectionVersionMismatch => ErrorCodes::VersionMismatch,
         }
     }
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct GetVectorsOrchestrator {
     state: ExecutionState,
     // Component Execution
@@ -62,7 +67,7 @@ pub struct GetVectorsOrchestrator {
     // Query state
     search_user_ids: Vec<String>,
     hnsw_segment_id: Uuid,
-    collection_id: Uuid,
+    collection_id: CollectionUuid,
     // State fetched or created for query execution
     record_segment: Option<Segment>,
     collection: Option<Collection>,
@@ -74,18 +79,24 @@ pub struct GetVectorsOrchestrator {
     // Result channel
     result_channel:
         Option<tokio::sync::oneshot::Sender<Result<GetVectorsResult, Box<dyn ChromaError>>>>,
+    collection_version: u32,
+    log_position: u64,
 }
 
+#[allow(dead_code)]
 impl GetVectorsOrchestrator {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         system: System,
         get_ids: Vec<String>,
         hnsw_segment_id: Uuid,
-        collection_id: Uuid,
+        collection_id: CollectionUuid,
         log: Box<Log>,
         sysdb: Box<SysDb>,
         dispatcher: ComponentHandle<Dispatcher>,
         blockfile_provider: BlockfileProvider,
+        collection_version: u32,
+        log_position: u64,
     ) -> Self {
         Self {
             state: ExecutionState::Pending,
@@ -100,6 +111,8 @@ impl GetVectorsOrchestrator {
             record_segment: None,
             collection: None,
             result_channel: None,
+            collection_version,
+            log_position,
         }
     }
 
@@ -130,9 +143,11 @@ impl GetVectorsOrchestrator {
             .expect("State machine invariant violation. The collection is not set when pulling logs. This should never happen.");
 
         let input = PullLogsInput::new(
-            collection.id,
+            collection.collection_id,
             // The collection log position is inclusive, and we want to start from the next log
-            collection.log_position + 1,
+            // Note that we query using the incoming log position this is critical for correctness
+            // TODO: We should make all the log service code use u64 instead of i64
+            (self.log_position as i64) + 1,
             100,
             None,
             Some(end_timestamp),
@@ -240,6 +255,16 @@ impl Component for GetVectorsOrchestrator {
                 return;
             }
         };
+
+        // If the collection version does not match the request version then we terminate with an error
+        if collection.version as u32 != self.collection_version {
+            terminate_with_error(
+                self.result_channel.take(),
+                Box::new(GetVectorsError::CollectionVersionMismatch),
+                ctx,
+            );
+            return;
+        }
 
         let record_segment =
             match get_record_segment_by_collection_id(self.sysdb.clone(), collection_id).await {

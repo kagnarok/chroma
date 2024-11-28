@@ -4,11 +4,6 @@ package chroma;
 
 option go_package = "github.com/chroma-core/chroma/go/pkg/proto/coordinatorpb";
 
-message Status {
-  string reason = 1;
-  int32 code = 2; // TODO: What is the enum of this code?
-}
-
 // Types here should mirror chromadb/types.py
 enum Operation {
     ADD = 0;
@@ -93,6 +88,11 @@ message OperationRecord {
     Operation operation = 4;
 }
 
+message RequestVersionContext {
+    uint32 collection_version = 1;
+    uint64 log_position = 2;
+}
+
 /* Metadata Reader Interface */
 
 service MetadataReader {
@@ -103,6 +103,7 @@ service MetadataReader {
 message CountRecordsRequest {
     string segment_id = 1;
     string collection_id = 2;
+    RequestVersionContext version_context = 3;
 }
 
 // TODO: Add error propagation in the response.
@@ -114,10 +115,12 @@ message QueryMetadataRequest {
     string segment_id = 1;
     Where where = 2;
     WhereDocument where_document = 3;
-    repeated string ids = 4;
-    optional int32 limit = 5;
-    optional int32 offset = 6;
+    optional UserIds ids = 4;
+    optional uint32 limit = 5;
+    optional uint32 offset = 6;
     string collection_id = 7;
+    bool include_metadata = 8;
+    RequestVersionContext version_context = 9;
 }
 
 message QueryMetadataResponse {
@@ -127,6 +130,11 @@ message QueryMetadataResponse {
 message MetadataEmbeddingRecord {
     string id = 1;
     UpdateMetadata metadata = 2;
+}
+
+// A `UserIds` should contain the set of user provided ids allowed in the result.
+message UserIds {
+    repeated string ids = 1;
 }
 
 // A `WhereDocument` clause for filtering metadata. A `WhereDocument` clause is a tree of
@@ -289,6 +297,7 @@ message GetVectorsRequest {
     repeated string ids = 1;
     string segment_id = 2;
     string collection_id = 3;
+    RequestVersionContext version_context = 4;
 }
 
 message GetVectorsResponse {
@@ -307,6 +316,7 @@ message QueryVectorsRequest {
     bool include_embeddings = 4;
     string segment_id = 5;
     string collection_id = 6;
+    RequestVersionContext version_context = 7;
     // TODO: options as in types.py, its currently unused so can add later
 }
 

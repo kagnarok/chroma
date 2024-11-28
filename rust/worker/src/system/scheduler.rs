@@ -44,19 +44,14 @@ impl Scheduler {
         let sender = ctx.receiver().clone();
         let handle = tokio::spawn(async move {
             select! {
-                _ = cancel.cancelled() => {
-                    return;
-                }
+                _ = cancel.cancelled() => {}
                 _ = tokio::time::sleep(duration) => {
                     let span = span_factory();
                     match sender.send(message, span).await {
                         Ok(_) => {
-                            return;
                         },
                         Err(e) => {
-                            // TODO: log error
-                            println!("Error: {:?}", e);
-                            return;
+                            tracing::error!("Error: {:?}", e);
                         }
                     }
                 }
@@ -72,6 +67,7 @@ impl Scheduler {
     /// Schedule a message to be sent to the component at a regular interval.
     ///
     /// `span_factory` is called immediately before sending the scheduled message to the component.
+    #[cfg(test)]
     pub(crate) fn schedule_interval<C, M, S>(
         &self,
         message: M,
@@ -101,8 +97,7 @@ impl Scheduler {
                             Ok(_) => {
                             },
                             Err(e) => {
-                                // TODO: log error
-                                println!("Error: {:?}", e);
+                                tracing::error!("Error: {:?}", e);
                             }
                         }
                     }
@@ -117,6 +112,7 @@ impl Scheduler {
         self.handles.write().push(handle);
     }
 
+    #[cfg(test)]
     fn should_continue(num_times: Option<usize>, counter: usize) -> bool {
         if num_times.is_some() {
             let num_times = num_times.unwrap();
@@ -130,14 +126,20 @@ impl Scheduler {
     // Note: this method holds the lock on the handles, should call it only after stop is
     // called.
     pub(crate) async fn join(&self) {
-        let mut handles = self.handles.write();
-        for handle in handles.iter_mut() {
-            if let Some(join_handle) = handle.join_handle.take() {
-                match join_handle.await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        println!("Error: {:?}", e);
-                    }
+        // NOTE(rescrv):  Leaving this clippy in place until we can re-arch our way out.
+        // Do NOT simply silence this warning.
+        let mut handles = {
+            let mut handles = self.handles.write();
+            handles
+                .iter_mut()
+                .flat_map(|h| h.join_handle.take())
+                .collect::<Vec<_>>()
+        };
+        for join_handle in handles.iter_mut() {
+            match join_handle.await {
+                Ok(_) => {}
+                Err(e) => {
+                    println!("Error: {:?}", e);
                 }
             }
         }
@@ -151,9 +153,11 @@ impl Scheduler {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::system::System;
+
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::time::Duration;

@@ -12,7 +12,7 @@ title: "🔑 Getting Started"
 
 {% /tabs %}
 
-Chroma is an AI-native open-source vector database. It comes with everything you need to get started built in, and runs on your machine. A [hosted version](https://airtable.com/shrOAiDUtS2ILy5vZ) is coming soon!
+Chroma is an AI-native open-source vector database. It comes with everything you need to get started built in, and runs on your machine. A [hosted version](https://airtable.com/shrOAiDUtS2ILy5vZ) is in early access!
 
 ### 1. Install
 
@@ -30,7 +30,7 @@ pip install chromadb # [!code $]
 {% codetab label="yarn" %}
 
 ```bash {% codetab=true %}
-yarn install chromadb chromadb-default-embed # [!code $]
+yarn add chromadb chromadb-default-embed # [!code $]
 ```
 
 {% /codetab %}
@@ -44,13 +44,13 @@ npm install --save chromadb chromadb-default-embed # [!code $]
 {% codetab label="pnpm" %}
 
 ```bash {% codetab=true %}
-pnpm install chromadb chromadb-default-embed # [!code $]
+pnpm add chromadb chromadb-default-embed # [!code $]
 ```
 
 {% /codetab %}
 {% /codetabs %}
 
-Install chroma via `pypi` to easily run the backend server. (Docker also available)
+Install chroma via `pypi` to easily run the backend server. ([Docker](./deployment/docker) also available)
 
 ```bash
 pip install chromadb # [!code $]
@@ -162,7 +162,7 @@ collection.add(
 {% tab label="Javascript" %}
 
 ```js
-await client.addRecords(collection, {
+await collection.add({
   documents: [
     "This is a document about pineapple",
     "This is a document about oranges",
@@ -194,7 +194,7 @@ print(results)
 {% tab label="Javascript" %}
 
 ```js
-const results = await client.queryRecords(collection, {
+const results = await collection.query({
   queryTexts: "This is a query document about hawaii", // Chroma will embed this for you
   nResults: 2, // how many results to return
 });
@@ -294,7 +294,7 @@ const collection = await client.getOrCreateCollection({
 });
 
 // switch `addRecords` to `upsertRecords` to avoid adding the same documents every time
-await client.upsertRecords(collection, {
+await collection.upsert({
   documents: [
     "This is a document about pineapple",
     "This is a document about oranges",
@@ -302,7 +302,7 @@ await client.upsertRecords(collection, {
   ids: ["id1", "id2"],
 });
 
-const results = await client.queryRecords(collection, {
+const results = await collection.query({
   queryTexts: "This is a query document about florida", // Chroma will embed this for you
   nResults: 2, // how many results to return
 });

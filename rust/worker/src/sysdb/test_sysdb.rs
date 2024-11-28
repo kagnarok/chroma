@@ -1,11 +1,11 @@
+use chroma_types::SegmentUuid;
 use chroma_types::{
-    Collection, FlushCompactionResponse, Segment, SegmentFlushInfo, SegmentScope, SegmentType,
-    Tenant,
+    Collection, CollectionUuid, FlushCompactionResponse, Segment, SegmentFlushInfo, SegmentScope,
+    SegmentType, Tenant,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use uuid::Uuid;
 
 use super::sysdb::FlushCompactionError;
 use super::sysdb::GetCollectionsError;
@@ -19,12 +19,13 @@ pub(crate) struct TestSysDb {
 
 #[derive(Debug)]
 struct Inner {
-    collections: HashMap<Uuid, Collection>,
-    segments: HashMap<Uuid, Segment>,
+    collections: HashMap<CollectionUuid, Collection>,
+    segments: HashMap<SegmentUuid, Segment>,
     tenant_last_compaction_time: HashMap<String, i64>,
 }
 
 impl TestSysDb {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         TestSysDb {
             inner: Arc::new(Mutex::new(Inner {
@@ -35,16 +36,21 @@ impl TestSysDb {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn add_collection(&mut self, collection: Collection) {
         let mut inner = self.inner.lock();
-        inner.collections.insert(collection.id, collection);
+        inner
+            .collections
+            .insert(collection.collection_id, collection);
     }
 
+    #[cfg(test)]
     pub(crate) fn add_segment(&mut self, segment: Segment) {
         let mut inner = self.inner.lock();
         inner.segments.insert(segment.id, segment);
     }
 
+    #[cfg(test)]
     pub(crate) fn add_tenant_last_compaction_time(
         &mut self,
         tenant: String,
@@ -58,12 +64,12 @@ impl TestSysDb {
 
     fn filter_collections(
         collection: &Collection,
-        collection_id: Option<Uuid>,
+        collection_id: Option<CollectionUuid>,
         name: Option<String>,
         tenant: Option<String>,
         database: Option<String>,
     ) -> bool {
-        if collection_id.is_some() && collection_id.unwrap() != collection.id {
+        if collection_id.is_some() && collection_id.unwrap() != collection.collection_id {
             return false;
         }
         if name.is_some() && name.unwrap() != collection.name {
@@ -80,10 +86,10 @@ impl TestSysDb {
 
     fn filter_segments(
         segment: &Segment,
-        id: Option<Uuid>,
+        id: Option<SegmentUuid>,
         r#type: Option<String>,
         scope: Option<SegmentScope>,
-        collection: Uuid,
+        collection: CollectionUuid,
     ) -> bool {
         if id.is_some() && id.unwrap() != segment.id {
             return false;
@@ -104,7 +110,7 @@ impl TestSysDb {
 impl TestSysDb {
     pub(crate) async fn get_collections(
         &mut self,
-        collection_id: Option<Uuid>,
+        collection_id: Option<CollectionUuid>,
         name: Option<String>,
         tenant: Option<String>,
         database: Option<String>,
@@ -113,7 +119,7 @@ impl TestSysDb {
         let mut collections = Vec::new();
         for collection in inner.collections.values() {
             if !TestSysDb::filter_collections(
-                &collection,
+                collection,
                 collection_id,
                 name.clone(),
                 tenant.clone(),
@@ -128,16 +134,15 @@ impl TestSysDb {
 
     pub(crate) async fn get_segments(
         &mut self,
-        id: Option<Uuid>,
+        id: Option<SegmentUuid>,
         r#type: Option<String>,
         scope: Option<SegmentScope>,
-        collection: Uuid,
+        collection: CollectionUuid,
     ) -> Result<Vec<Segment>, GetSegmentsError> {
         let inner = self.inner.lock();
         let mut segments = Vec::new();
         for segment in inner.segments.values() {
-            if !TestSysDb::filter_segments(&segment, id, r#type.clone(), scope.clone(), collection)
-            {
+            if !TestSysDb::filter_segments(segment, id, r#type.clone(), scope.clone(), collection) {
                 continue;
             }
             segments.push(segment.clone());
@@ -155,7 +160,6 @@ impl TestSysDb {
             let last_compaction_time = match inner.tenant_last_compaction_time.get(&tenant_id) {
                 Some(last_compaction_time) => *last_compaction_time,
                 None => {
-                    // TODO: Log an error
                     return Err(GetLastCompactionTimeError::TenantNotFound);
                 }
             };
@@ -170,7 +174,7 @@ impl TestSysDb {
     pub(crate) async fn flush_compaction(
         &mut self,
         tenant_id: String,
-        collection_id: Uuid,
+        collection_id: CollectionUuid,
         log_position: i64,
         collection_version: i32,
         segment_flush_info: Arc<[SegmentFlushInfo]>,
@@ -185,7 +189,9 @@ impl TestSysDb {
         collection.log_position = log_position;
         let new_collection_version = collection_version + 1;
         collection.version = new_collection_version;
-        inner.collections.insert(collection.id, collection);
+        inner
+            .collections
+            .insert(collection.collection_id, collection);
         let mut last_compaction_time = match inner.tenant_last_compaction_time.get(&tenant_id) {
             Some(last_compaction_time) => *last_compaction_time,
             None => 0,

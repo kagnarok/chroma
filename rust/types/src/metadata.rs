@@ -1,14 +1,18 @@
-use crate::chroma_proto;
 use chroma_error::{ChromaError, ErrorCodes};
-use std::collections::{HashMap, HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+};
 use thiserror::Error;
+
+use crate::chroma_proto;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpdateMetadataValue {
-    Int(i32),
+    Bool(bool),
+    Int(i64),
     Float(f64),
     Str(String),
-    Bool(bool),
     None,
 }
 
@@ -31,8 +35,11 @@ impl TryFrom<&chroma_proto::UpdateMetadataValue> for UpdateMetadataValue {
 
     fn try_from(value: &chroma_proto::UpdateMetadataValue) -> Result<Self, Self::Error> {
         match &value.value {
+            Some(chroma_proto::update_metadata_value::Value::BoolValue(value)) => {
+                Ok(UpdateMetadataValue::Bool(*value))
+            }
             Some(chroma_proto::update_metadata_value::Value::IntValue(value)) => {
-                Ok(UpdateMetadataValue::Int(*value as i32))
+                Ok(UpdateMetadataValue::Int(*value))
             }
             Some(chroma_proto::update_metadata_value::Value::FloatValue(value)) => {
                 Ok(UpdateMetadataValue::Float(*value))
@@ -40,23 +47,20 @@ impl TryFrom<&chroma_proto::UpdateMetadataValue> for UpdateMetadataValue {
             Some(chroma_proto::update_metadata_value::Value::StringValue(value)) => {
                 Ok(UpdateMetadataValue::Str(value.clone()))
             }
-            Some(chroma_proto::update_metadata_value::Value::BoolValue(value)) => {
-                Ok(UpdateMetadataValue::Bool(*value))
-            }
             // Used to communicate that the user wants to delete this key.
             None => Ok(UpdateMetadataValue::None),
-            _ => Err(UpdateMetadataValueConversionError::InvalidValue),
         }
     }
 }
 
 impl From<UpdateMetadataValue> for chroma_proto::UpdateMetadataValue {
     fn from(value: UpdateMetadataValue) -> Self {
-        let proto_value = match value {
+        match value {
+            UpdateMetadataValue::Bool(value) => chroma_proto::UpdateMetadataValue {
+                value: Some(chroma_proto::update_metadata_value::Value::BoolValue(value)),
+            },
             UpdateMetadataValue::Int(value) => chroma_proto::UpdateMetadataValue {
-                value: Some(chroma_proto::update_metadata_value::Value::IntValue(
-                    value as i64,
-                )),
+                value: Some(chroma_proto::update_metadata_value::Value::IntValue(value)),
             },
             UpdateMetadataValue::Float(value) => chroma_proto::UpdateMetadataValue {
                 value: Some(chroma_proto::update_metadata_value::Value::FloatValue(
@@ -68,12 +72,8 @@ impl From<UpdateMetadataValue> for chroma_proto::UpdateMetadataValue {
                     value,
                 )),
             },
-            UpdateMetadataValue::Bool(value) => chroma_proto::UpdateMetadataValue {
-                value: Some(chroma_proto::update_metadata_value::Value::BoolValue(value)),
-            },
             UpdateMetadataValue::None => chroma_proto::UpdateMetadataValue { value: None },
-        };
-        proto_value
+        }
     }
 }
 
@@ -82,10 +82,10 @@ impl TryFrom<&UpdateMetadataValue> for MetadataValue {
 
     fn try_from(value: &UpdateMetadataValue) -> Result<Self, Self::Error> {
         match value {
+            UpdateMetadataValue::Bool(value) => Ok(MetadataValue::Bool(*value)),
             UpdateMetadataValue::Int(value) => Ok(MetadataValue::Int(*value)),
             UpdateMetadataValue::Float(value) => Ok(MetadataValue::Float(*value)),
             UpdateMetadataValue::Str(value) => Ok(MetadataValue::Str(value.clone())),
-            UpdateMetadataValue::Bool(value) => Ok(MetadataValue::Bool(*value)),
             UpdateMetadataValue::None => Err(MetadataValueConversionError::InvalidValue),
         }
     }
@@ -97,15 +97,36 @@ MetadataValue
 ===========================================
 */
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub enum MetadataValue {
-    Int(i32),
+    Bool(bool),
+    Int(i64),
     Float(f64),
     Str(String),
-    Bool(bool),
 }
 
-impl TryFrom<&MetadataValue> for i32 {
+impl Eq for MetadataValue {}
+
+/// We need `Eq` and `Ord` since we want to use this as a key in `BTreeMap`
+/// We are not planning to support `f64::NaN`s anyway, so the `PartialOrd` and `Ord` should be identical
+impl Ord for &MetadataValue {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    }
+}
+
+impl TryFrom<&MetadataValue> for bool {
+    type Error = MetadataValueConversionError;
+
+    fn try_from(value: &MetadataValue) -> Result<Self, Self::Error> {
+        match value {
+            MetadataValue::Bool(value) => Ok(*value),
+            _ => Err(MetadataValueConversionError::InvalidValue),
+        }
+    }
+}
+
+impl TryFrom<&MetadataValue> for i64 {
     type Error = MetadataValueConversionError;
 
     fn try_from(value: &MetadataValue) -> Result<Self, Self::Error> {
@@ -122,17 +143,6 @@ impl TryFrom<&MetadataValue> for f64 {
     fn try_from(value: &MetadataValue) -> Result<Self, Self::Error> {
         match value {
             MetadataValue::Float(value) => Ok(*value),
-            _ => Err(MetadataValueConversionError::InvalidValue),
-        }
-    }
-}
-
-impl TryFrom<&MetadataValue> for bool {
-    type Error = MetadataValueConversionError;
-
-    fn try_from(value: &MetadataValue) -> Result<Self, Self::Error> {
-        match value {
-            MetadataValue::Bool(value) => Ok(*value),
             _ => Err(MetadataValueConversionError::InvalidValue),
         }
     }
@@ -168,17 +178,17 @@ impl TryFrom<&chroma_proto::UpdateMetadataValue> for MetadataValue {
 
     fn try_from(value: &chroma_proto::UpdateMetadataValue) -> Result<Self, Self::Error> {
         match &value.value {
+            Some(chroma_proto::update_metadata_value::Value::BoolValue(value)) => {
+                Ok(MetadataValue::Bool(*value))
+            }
             Some(chroma_proto::update_metadata_value::Value::IntValue(value)) => {
-                Ok(MetadataValue::Int(*value as i32))
+                Ok(MetadataValue::Int(*value))
             }
             Some(chroma_proto::update_metadata_value::Value::FloatValue(value)) => {
                 Ok(MetadataValue::Float(*value))
             }
             Some(chroma_proto::update_metadata_value::Value::StringValue(value)) => {
                 Ok(MetadataValue::Str(value.clone()))
-            }
-            Some(chroma_proto::update_metadata_value::Value::BoolValue(value)) => {
-                Ok(MetadataValue::Bool(*value))
             }
             _ => Err(MetadataValueConversionError::InvalidValue),
         }
@@ -187,11 +197,9 @@ impl TryFrom<&chroma_proto::UpdateMetadataValue> for MetadataValue {
 
 impl From<MetadataValue> for chroma_proto::UpdateMetadataValue {
     fn from(value: MetadataValue) -> Self {
-        let proto_value = match value {
+        match value {
             MetadataValue::Int(value) => chroma_proto::UpdateMetadataValue {
-                value: Some(chroma_proto::update_metadata_value::Value::IntValue(
-                    value as i64,
-                )),
+                value: Some(chroma_proto::update_metadata_value::Value::IntValue(value)),
             },
             MetadataValue::Float(value) => chroma_proto::UpdateMetadataValue {
                 value: Some(chroma_proto::update_metadata_value::Value::FloatValue(
@@ -206,8 +214,7 @@ impl From<MetadataValue> for chroma_proto::UpdateMetadataValue {
             MetadataValue::Bool(value) => chroma_proto::UpdateMetadataValue {
                 value: Some(chroma_proto::update_metadata_value::Value::BoolValue(value)),
             },
-        };
-        proto_value
+        }
     }
 }
 
@@ -271,6 +278,23 @@ Metadata
 pub type Metadata = HashMap<String, MetadataValue>;
 pub type DeletedMetadata = HashSet<String>;
 
+pub fn get_metadata_value_as<'a, T>(
+    metadata: &'a Metadata,
+    key: &str,
+) -> Result<T, Box<MetadataValueConversionError>>
+where
+    T: TryFrom<&'a MetadataValue, Error = MetadataValueConversionError>,
+{
+    let res = match metadata.get(key) {
+        Some(value) => T::try_from(value),
+        None => return Err(Box::new(MetadataValueConversionError::InvalidValue)),
+    };
+    match res {
+        Ok(value) => Ok(value),
+        Err(_) => Err(Box::new(MetadataValueConversionError::InvalidValue)),
+    }
+}
+
 impl TryFrom<chroma_proto::UpdateMetadata> for Metadata {
     type Error = MetadataValueConversionError;
 
@@ -288,6 +312,7 @@ impl TryFrom<chroma_proto::UpdateMetadata> for Metadata {
     }
 }
 
+#[derive(Debug, Default)]
 pub struct MetadataDelta<'referred_data> {
     pub metadata_to_update: HashMap<
         &'referred_data str,
@@ -299,11 +324,7 @@ pub struct MetadataDelta<'referred_data> {
 
 impl<'referred_data> MetadataDelta<'referred_data> {
     pub fn new() -> Self {
-        Self {
-            metadata_to_update: HashMap::new(),
-            metadata_to_delete: HashMap::new(),
-            metadata_to_insert: HashMap::new(),
-        }
+        Self::default()
     }
 }
 
@@ -313,44 +334,49 @@ Metadata queries
 ===========================================
 */
 
+/// This `Where` enum serves as an unified representation for the `where` and `where_document` clauses.
+/// Although this is not unified in the API level due to legacy design choices, in the future we will be
+/// unifying them together, and the structure of the unified AST should be identical to the one here.
+/// Currently both `where` and `where_document` clauses will be translated into `Where`, and if both are
+/// present we simply create a conjunction of both clauses as the actual filter. This is consistent with
+/// the semantics we used to have when the `where` and `where_document` clauses are treated seperately.
+/// TODO: Remove this note once the `where` clause and `where_document` clause is unified in the API level.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Where {
-    DirectWhereComparison(DirectComparison),
+    DirectWhereComparison(DirectWhereComparison),
+    DirectWhereDocumentComparison(DirectDocumentComparison),
     WhereChildren(WhereChildren),
 }
 
+impl Where {
+    pub fn conjunction(children: Vec<Where>) -> Self {
+        Self::WhereChildren(WhereChildren {
+            operator: BooleanOperator::And,
+            children,
+        })
+    }
+    pub fn disjunction(children: Vec<Where>) -> Self {
+        Self::WhereChildren(WhereChildren {
+            operator: BooleanOperator::Or,
+            children,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
-pub struct DirectComparison {
+pub struct DirectWhereComparison {
     pub key: String,
     pub comparison: WhereComparison,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum WhereComparison {
-    SingleStringComparison(String, WhereClauseComparator),
-    SingleIntComparison(u32, WhereClauseComparator),
-    SingleDoubleComparison(f64, WhereClauseComparator),
-    StringListComparison(Vec<String>, WhereClauseListOperator),
-    IntListComparison(Vec<u32>, WhereClauseListOperator),
-    DoubleListComparison(Vec<f64>, WhereClauseListOperator),
-    BoolListComparison(Vec<bool>, WhereClauseListOperator),
-    SingleBoolComparison(bool, WhereClauseComparator),
-}
-
-#[derive(Debug)]
-pub enum MetadataType {
-    StringType,
-    IntType,
-    DoubleType,
-    StringListType,
-    IntListType,
-    DoubleListType,
-    BoolListType,
-    BoolType,
+    Primitive(PrimitiveOperator, MetadataValue),
+    Set(SetOperator, MetadataSetValue),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum WhereClauseComparator {
+pub enum PrimitiveOperator {
     Equal,
     NotEqual,
     GreaterThan,
@@ -360,15 +386,23 @@ pub enum WhereClauseComparator {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum WhereClauseListOperator {
+pub enum SetOperator {
     In,
     NotIn,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum MetadataSetValue {
+    Bool(Vec<bool>),
+    Int(Vec<i64>),
+    Float(Vec<f64>),
+    Str(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct WhereChildren {
-    pub children: Vec<Where>,
     pub operator: BooleanOperator,
+    pub children: Vec<Where>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -378,27 +412,15 @@ pub enum BooleanOperator {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum WhereDocument {
-    DirectWhereDocumentComparison(DirectDocumentComparison),
-    WhereDocumentChildren(WhereDocumentChildren),
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct DirectDocumentComparison {
+    pub operator: DocumentOperator,
     pub document: String,
-    pub operator: WhereDocumentOperator,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum WhereDocumentOperator {
+pub enum DocumentOperator {
     Contains,
     NotContains,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct WhereDocumentChildren {
-    pub children: Vec<WhereDocument>,
-    pub operator: BooleanOperator,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -414,7 +436,7 @@ impl TryFrom<chroma_proto::Where> for Where {
     fn try_from(proto_where: chroma_proto::Where) -> Result<Self, Self::Error> {
         match proto_where.r#where {
             Some(chroma_proto::r#where::Where::DirectComparison(proto_comparison)) => {
-                let comparison = DirectComparison {
+                let comparison = DirectWhereComparison {
                     key: proto_comparison.key.clone(),
                     comparison: proto_comparison.try_into()?,
                 };
@@ -446,181 +468,118 @@ impl TryFrom<chroma_proto::DirectComparison> for WhereComparison {
     type Error = WhereConversionError;
 
     fn try_from(proto_comparison: chroma_proto::DirectComparison) -> Result<Self, Self::Error> {
-        match proto_comparison.r#comparison {
-            Some(chroma_proto::direct_comparison::Comparison::SingleStringOperand(
-                proto_string,
-            )) => {
-                let comparator = match TryInto::<chroma_proto::GenericComparator>::try_into(
-                    proto_string.comparator,
-                ) {
-                    Ok(comparator) => comparator,
-                    Err(_) => return Err(WhereConversionError::InvalidWhereComparison),
-                };
-                Ok(WhereComparison::SingleStringComparison(
-                    proto_string.value,
-                    comparator.try_into()?,
-                ))
-            }
-            Some(chroma_proto::direct_comparison::Comparison::SingleBoolOperand(proto_bool)) => {
-                let comparator = match TryInto::<chroma_proto::GenericComparator>::try_into(
-                    proto_bool.comparator,
-                ) {
-                    Ok(comparator) => comparator,
-                    Err(_) => return Err(WhereConversionError::InvalidWhereComparison),
-                };
-                Ok(WhereComparison::SingleBoolComparison(
-                    proto_bool.value,
-                    comparator.try_into()?,
-                ))
-            }
-            Some(chroma_proto::direct_comparison::Comparison::SingleIntOperand(proto_int)) => {
-                let comparator: WhereClauseComparator = match proto_int.comparator {
-                    Some(comparator) => match comparator {
-                        chroma_proto::single_int_comparison::Comparator::NumberComparator(
-                            proto_comparator,
-                        ) => {
-                            match TryInto::<chroma_proto::NumberComparator>::try_into(
-                                proto_comparator,
-                            ) {
-                                Ok(comparator) => comparator.try_into()?,
-                                Err(_) => return Err(WhereConversionError::InvalidWhereComparison),
-                            }
-                        }
-                        chroma_proto::single_int_comparison::Comparator::GenericComparator(
-                            proto_comparator,
-                        ) => {
-                            match TryInto::<chroma_proto::GenericComparator>::try_into(
-                                proto_comparator,
-                            ) {
-                                Ok(comparator) => comparator.try_into()?,
-                                Err(_) => return Err(WhereConversionError::InvalidWhereComparison),
-                            }
-                        }
+        let id_to_generic_comparator = |id| {
+            TryInto::<chroma_proto::GenericComparator>::try_into(id)
+                .map_err(|_| WhereConversionError::InvalidWhereComparison)?
+                .try_into()
+        };
+        let id_to_number_comparator = |id| {
+            TryInto::<chroma_proto::NumberComparator>::try_into(id)
+                .map_err(|_| WhereConversionError::InvalidWhereComparison)?
+                .try_into()
+        };
+        let id_to_set_comparator = |id| {
+            TryInto::<chroma_proto::ListOperator>::try_into(id)
+                .map_err(|_| WhereConversionError::InvalidWhereComparison)?
+                .try_into()
+        };
+        if let Some(proto_comp) = proto_comparison.r#comparison {
+            use chroma_proto::direct_comparison::Comparison::*;
+            match proto_comp {
+                SingleBoolOperand(single_bool_comparison) => Ok(WhereComparison::Primitive(
+                    id_to_generic_comparator(single_bool_comparison.comparator)?,
+                    MetadataValue::Bool(single_bool_comparison.value),
+                )),
+                SingleStringOperand(single_string_comparison) => Ok(WhereComparison::Primitive(
+                    id_to_generic_comparator(single_string_comparison.comparator)?,
+                    MetadataValue::Str(single_string_comparison.value),
+                )),
+                SingleIntOperand(single_int_comparison) => Ok(WhereComparison::Primitive(
+                    match single_int_comparison.comparator {
+                        Some(
+                            chroma_proto::single_int_comparison::Comparator::GenericComparator(
+                                proto_generic_comparator,
+                            ),
+                        ) => id_to_generic_comparator(proto_generic_comparator)?,
+                        Some(
+                            chroma_proto::single_int_comparison::Comparator::NumberComparator(
+                                proto_number_comparator,
+                            ),
+                        ) => id_to_number_comparator(proto_number_comparator)?,
+                        None => PrimitiveOperator::Equal,
                     },
-                    None => WhereClauseComparator::Equal,
-                };
-                Ok(WhereComparison::SingleIntComparison(
-                    proto_int.value as u32,
-                    comparator,
-                ))
-            }
-            Some(chroma_proto::direct_comparison::Comparison::SingleDoubleOperand(
-                proto_double,
-            )) => {
-                let comparator: WhereClauseComparator = match proto_double.comparator {
-                    Some(comparator) => match comparator {
-                        chroma_proto::single_double_comparison::Comparator::NumberComparator(
-                            proto_comparator,
-                        ) => {
-                            match TryInto::<chroma_proto::NumberComparator>::try_into(
-                                proto_comparator,
-                            ) {
-                                Ok(comparator) => comparator.try_into()?,
-                                Err(_) => return Err(WhereConversionError::InvalidWhereComparison),
-                            }
-                        }
-                        chroma_proto::single_double_comparison::Comparator::GenericComparator(
-                            proto_comparator,
-                        ) => {
-                            match TryInto::<chroma_proto::GenericComparator>::try_into(
-                                proto_comparator,
-                            ) {
-                                Ok(comparator) => comparator.try_into()?,
-                                Err(_) => return Err(WhereConversionError::InvalidWhereComparison),
-                            }
-                        }
+                    MetadataValue::Int(single_int_comparison.value),
+                )),
+                SingleDoubleOperand(single_double_comparison) => Ok(WhereComparison::Primitive(
+                    match single_double_comparison.comparator {
+                        Some(
+                            chroma_proto::single_double_comparison::Comparator::GenericComparator(
+                                proto_generic_comparator,
+                            ),
+                        ) => id_to_generic_comparator(proto_generic_comparator)?,
+                        Some(
+                            chroma_proto::single_double_comparison::Comparator::NumberComparator(
+                                proto_number_comparator,
+                            ),
+                        ) => id_to_number_comparator(proto_number_comparator)?,
+                        None => PrimitiveOperator::Equal,
                     },
-                    None => WhereClauseComparator::Equal,
-                };
-                Ok(WhereComparison::SingleDoubleComparison(
-                    proto_double.value,
-                    comparator,
-                ))
+                    MetadataValue::Float(single_double_comparison.value),
+                )),
+                BoolListOperand(bool_list_comparison) => Ok(WhereComparison::Set(
+                    id_to_set_comparator(bool_list_comparison.list_operator)?,
+                    MetadataSetValue::Bool(bool_list_comparison.values),
+                )),
+                StringListOperand(string_list_comparison) => Ok(WhereComparison::Set(
+                    id_to_set_comparator(string_list_comparison.list_operator)?,
+                    MetadataSetValue::Str(string_list_comparison.values),
+                )),
+                IntListOperand(int_list_comparison) => Ok(WhereComparison::Set(
+                    id_to_set_comparator(int_list_comparison.list_operator)?,
+                    MetadataSetValue::Int(int_list_comparison.values),
+                )),
+                DoubleListOperand(double_list_comparison) => Ok(WhereComparison::Set(
+                    id_to_set_comparator(double_list_comparison.list_operator)?,
+                    MetadataSetValue::Float(double_list_comparison.values),
+                )),
             }
-            Some(chroma_proto::direct_comparison::Comparison::StringListOperand(proto_list)) => {
-                let list_operator =
-                    match TryInto::<chroma_proto::ListOperator>::try_into(proto_list.list_operator)
-                    {
-                        Ok(list_operator) => list_operator,
-                        Err(_) => return Err(WhereConversionError::InvalidWhereComparison),
-                    };
-                Ok(WhereComparison::StringListComparison(
-                    proto_list.values,
-                    list_operator.try_into()?,
-                ))
-            }
-            Some(chroma_proto::direct_comparison::Comparison::IntListOperand(proto_list)) => {
-                let list_operator =
-                    match TryInto::<chroma_proto::ListOperator>::try_into(proto_list.list_operator)
-                    {
-                        Ok(list_operator) => list_operator,
-                        Err(_) => return Err(WhereConversionError::InvalidWhereComparison),
-                    };
-                Ok(WhereComparison::IntListComparison(
-                    proto_list.values.into_iter().map(|v| v as u32).collect(),
-                    list_operator.try_into()?,
-                ))
-            }
-            Some(chroma_proto::direct_comparison::Comparison::DoubleListOperand(proto_list)) => {
-                let list_operator =
-                    match TryInto::<chroma_proto::ListOperator>::try_into(proto_list.list_operator)
-                    {
-                        Ok(list_operator) => list_operator,
-                        Err(_) => return Err(WhereConversionError::InvalidWhereComparison),
-                    };
-                Ok(WhereComparison::DoubleListComparison(
-                    proto_list.values,
-                    list_operator.try_into()?,
-                ))
-            }
-            Some(chroma_proto::direct_comparison::Comparison::BoolListOperand(proto_list)) => {
-                let list_operator =
-                    match TryInto::<chroma_proto::ListOperator>::try_into(proto_list.list_operator)
-                    {
-                        Ok(list_operator) => list_operator,
-                        Err(_) => return Err(WhereConversionError::InvalidWhereComparison),
-                    };
-                Ok(WhereComparison::BoolListComparison(
-                    proto_list.values,
-                    list_operator.try_into()?,
-                ))
-            }
-            None => Err(WhereConversionError::InvalidWhereComparison),
+        } else {
+            Err(WhereConversionError::InvalidWhereComparison)
         }
     }
 }
 
-impl TryFrom<chroma_proto::NumberComparator> for WhereClauseComparator {
+impl TryFrom<chroma_proto::NumberComparator> for PrimitiveOperator {
     type Error = WhereConversionError;
 
     fn try_from(proto_comparator: chroma_proto::NumberComparator) -> Result<Self, Self::Error> {
         match proto_comparator {
-            chroma_proto::NumberComparator::Gt => Ok(WhereClauseComparator::GreaterThan),
-            chroma_proto::NumberComparator::Gte => Ok(WhereClauseComparator::GreaterThanOrEqual),
-            chroma_proto::NumberComparator::Lt => Ok(WhereClauseComparator::LessThan),
-            chroma_proto::NumberComparator::Lte => Ok(WhereClauseComparator::LessThanOrEqual),
+            chroma_proto::NumberComparator::Gt => Ok(PrimitiveOperator::GreaterThan),
+            chroma_proto::NumberComparator::Gte => Ok(PrimitiveOperator::GreaterThanOrEqual),
+            chroma_proto::NumberComparator::Lt => Ok(PrimitiveOperator::LessThan),
+            chroma_proto::NumberComparator::Lte => Ok(PrimitiveOperator::LessThanOrEqual),
         }
     }
 }
 
-impl TryFrom<chroma_proto::GenericComparator> for WhereClauseComparator {
+impl TryFrom<chroma_proto::GenericComparator> for PrimitiveOperator {
     type Error = WhereConversionError;
 
     fn try_from(proto_comparator: chroma_proto::GenericComparator) -> Result<Self, Self::Error> {
         match proto_comparator {
-            chroma_proto::GenericComparator::Eq => Ok(WhereClauseComparator::Equal),
-            chroma_proto::GenericComparator::Ne => Ok(WhereClauseComparator::NotEqual),
+            chroma_proto::GenericComparator::Eq => Ok(PrimitiveOperator::Equal),
+            chroma_proto::GenericComparator::Ne => Ok(PrimitiveOperator::NotEqual),
         }
     }
 }
 
-impl TryFrom<chroma_proto::ListOperator> for WhereClauseListOperator {
+impl TryFrom<chroma_proto::ListOperator> for SetOperator {
     type Error = WhereConversionError;
 
     fn try_from(proto_operator: chroma_proto::ListOperator) -> Result<Self, Self::Error> {
         match proto_operator {
-            chroma_proto::ListOperator::In => Ok(WhereClauseListOperator::In),
-            chroma_proto::ListOperator::Nin => Ok(WhereClauseListOperator::NotIn),
+            chroma_proto::ListOperator::In => Ok(SetOperator::In),
+            chroma_proto::ListOperator::Nin => Ok(SetOperator::NotIn),
         }
     }
 }
@@ -654,7 +613,7 @@ impl TryFrom<chroma_proto::BooleanOperator> for BooleanOperator {
     }
 }
 
-impl TryFrom<chroma_proto::WhereDocument> for WhereDocument {
+impl TryFrom<chroma_proto::WhereDocument> for Where {
     type Error = WhereConversionError;
 
     fn try_from(proto_document: chroma_proto::WhereDocument) -> Result<Self, Self::Error> {
@@ -670,7 +629,7 @@ impl TryFrom<chroma_proto::WhereDocument> for WhereDocument {
                     document: proto_comparison.document,
                     operator: operator.try_into()?,
                 };
-                Ok(WhereDocument::DirectWhereDocumentComparison(comparison))
+                Ok(Where::DirectWhereDocumentComparison(comparison))
             }
             Some(chroma_proto::where_document::WhereDocument::Children(proto_children)) => {
                 let operator = match TryInto::<chroma_proto::BooleanOperator>::try_into(
@@ -679,30 +638,28 @@ impl TryFrom<chroma_proto::WhereDocument> for WhereDocument {
                     Ok(operator) => operator,
                     Err(_) => return Err(WhereConversionError::InvalidWhereChildren),
                 };
-                let children = WhereDocumentChildren {
+                let children = WhereChildren {
                     children: proto_children
                         .children
                         .into_iter()
                         .map(|child| child.try_into())
-                        .collect::<Result<Vec<WhereDocument>, WhereConversionError>>()?,
+                        .collect::<Result<_, _>>()?,
                     operator: operator.try_into()?,
                 };
-                Ok(WhereDocument::WhereDocumentChildren(children))
+                Ok(Where::WhereChildren(children))
             }
             None => Err(WhereConversionError::InvalidWhere),
         }
     }
 }
 
-impl TryFrom<chroma_proto::WhereDocumentOperator> for WhereDocumentOperator {
+impl TryFrom<chroma_proto::WhereDocumentOperator> for DocumentOperator {
     type Error = WhereConversionError;
 
     fn try_from(proto_operator: chroma_proto::WhereDocumentOperator) -> Result<Self, Self::Error> {
         match proto_operator {
-            chroma_proto::WhereDocumentOperator::Contains => Ok(WhereDocumentOperator::Contains),
-            chroma_proto::WhereDocumentOperator::NotContains => {
-                Ok(WhereDocumentOperator::NotContains)
-            }
+            chroma_proto::WhereDocumentOperator::Contains => Ok(DocumentOperator::Contains),
+            chroma_proto::WhereDocumentOperator::NotContains => Ok(DocumentOperator::NotContains),
         }
     }
 }
@@ -815,8 +772,8 @@ mod tests {
             Where::DirectWhereComparison(comparison) => {
                 assert_eq!(comparison.key, "foo");
                 match comparison.comparison {
-                    WhereComparison::SingleIntComparison(value, _) => {
-                        assert_eq!(value, 42);
+                    WhereComparison::Primitive(_, value) => {
+                        assert_eq!(value, MetadataValue::Int(42));
                     }
                     _ => panic!("Invalid comparison type"),
                 }
@@ -862,7 +819,7 @@ mod tests {
                             )),
                         },
                     ],
-                    operator: chroma_proto::BooleanOperator::And.try_into().unwrap(),
+                    operator: chroma_proto::BooleanOperator::And.into(),
                 },
             )),
         };
@@ -882,17 +839,15 @@ mod tests {
             r#where_document: Some(chroma_proto::where_document::WhereDocument::Direct(
                 chroma_proto::DirectWhereDocument {
                     document: "foo".to_string(),
-                    operator: chroma_proto::WhereDocumentOperator::Contains
-                        .try_into()
-                        .unwrap(),
+                    operator: chroma_proto::WhereDocumentOperator::Contains.into(),
                 },
             )),
         };
-        let where_document: WhereDocument = proto_where.try_into().unwrap();
+        let where_document: Where = proto_where.try_into().unwrap();
         match where_document {
-            WhereDocument::DirectWhereDocumentComparison(comparison) => {
+            Where::DirectWhereDocumentComparison(comparison) => {
                 assert_eq!(comparison.document, "foo");
-                assert_eq!(comparison.operator, WhereDocumentOperator::Contains);
+                assert_eq!(comparison.operator, DocumentOperator::Contains);
             }
             _ => panic!("Invalid where document type"),
         }
@@ -910,8 +865,7 @@ mod tests {
                                     chroma_proto::DirectWhereDocument {
                                         document: "foo".to_string(),
                                         operator: chroma_proto::WhereDocumentOperator::Contains
-                                            .try_into()
-                                            .unwrap(),
+                                            .into(),
                                     },
                                 ),
                             ),
@@ -922,20 +876,19 @@ mod tests {
                                     chroma_proto::DirectWhereDocument {
                                         document: "bar".to_string(),
                                         operator: chroma_proto::WhereDocumentOperator::Contains
-                                            .try_into()
-                                            .unwrap(),
+                                            .into(),
                                     },
                                 ),
                             ),
                         },
                     ],
-                    operator: chroma_proto::BooleanOperator::And.try_into().unwrap(),
+                    operator: chroma_proto::BooleanOperator::And.into(),
                 },
             )),
         };
-        let where_document: WhereDocument = proto_where.try_into().unwrap();
+        let where_document: Where = proto_where.try_into().unwrap();
         match where_document {
-            WhereDocument::WhereDocumentChildren(children) => {
+            Where::WhereChildren(children) => {
                 assert_eq!(children.children.len(), 2);
                 assert_eq!(children.operator, BooleanOperator::And);
             }

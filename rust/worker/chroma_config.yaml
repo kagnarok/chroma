@@ -5,7 +5,7 @@
 
 query_service:
     service_name: "query-service"
-    otel_endpoint: "http://jaeger:4317"
+    otel_endpoint: "http://otel-collector:4317"
     my_member_id: "query-service-0"
     my_port: 50051
     assignment_policy:
@@ -30,6 +30,7 @@ query_service:
                 connect_timeout_ms: 5000
                 request_timeout_ms: 30000 # 1 minute
                 upload_part_size_bytes: 536870912 # 512MiB
+                download_part_size_bytes: 8388608 # 8MiB
             rate_limiting_policy:
                 CountBasedPolicy:
                     max_concurrent_requests: 15
@@ -57,12 +58,12 @@ query_service:
     hnsw_provider:
         hnsw_temporary_path: "~/tmp"
         hnsw_cache_config:
-            lru:
-                capacity: 1000
+            weighted_lru:
+                capacity: 8589934592 # 8GB
 
 compaction_service:
     service_name: "compaction-service"
-    otel_endpoint: "http://jaeger:4317"
+    otel_endpoint: "http://otel-collector:4317"
     my_member_id: "compaction-service-0"
     my_port: 50051
     assignment_policy:
@@ -87,6 +88,7 @@ compaction_service:
                 connect_timeout_ms: 5000
                 request_timeout_ms: 60000 # 1 minute
                 upload_part_size_bytes: 536870912 # 512MiB
+                download_part_size_bytes: 8388608 # 8MiB
             rate_limiting_policy:
                 CountBasedPolicy:
                     max_concurrent_requests: 15
@@ -105,6 +107,8 @@ compaction_service:
         max_concurrent_jobs: 100
         compaction_interval_sec: 10
         min_compaction_size: 10
+        max_compaction_size: 10000
+        max_partition_size: 5000
     blockfile_provider:
         Arrow:
             block_manager_config:
@@ -119,5 +123,5 @@ compaction_service:
     hnsw_provider:
         hnsw_temporary_path: "~/tmp"
         hnsw_cache_config:
-            lru:
-                capacity: 1000
+            weighted_lru:
+                capacity: 8192 # 8192 MiB = 8GB

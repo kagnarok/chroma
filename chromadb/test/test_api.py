@@ -102,7 +102,7 @@ def test_persist_index_loading(api_fixture, request):
 def test_persist_index_loading_embedding_function(api_fixture, request):
     class TestEF(EmbeddingFunction[Document]):
         def __call__(self, input):
-            return [[1, 2, 3] for _ in range(len(input))]
+            return [np.array([1, 2, 3]) for _ in range(len(input))]
 
     client = request.getfixturevalue("local_persist_api")
     client.reset()
@@ -131,7 +131,7 @@ def test_persist_index_loading_embedding_function(api_fixture, request):
 def test_persist_index_get_or_create_embedding_function(api_fixture, request):
     class TestEF(EmbeddingFunction[Document]):
         def __call__(self, input):
-            return [[1, 2, 3] for _ in range(len(input))]
+            return [np.array([1, 2, 3]) for _ in range(len(input))]
 
     api = request.getfixturevalue("local_persist_api")
     api.reset()
@@ -157,7 +157,7 @@ def test_persist_index_get_or_create_embedding_function(api_fixture, request):
             assert nn[key] is None
 
     assert nn["ids"] == [["id1"]]
-    assert nn["embeddings"] == [[[1, 2, 3]]]
+    assert nn["embeddings"][0][0].tolist() == [1, 2, 3]
     assert nn["documents"] == [["hello"]]
     assert nn["distances"] == [[0]]
 
@@ -315,7 +315,6 @@ def test_get_nearest_neighbors(client):
     nn = collection.query(
         query_embeddings=[1.1, 2.3, 3.2],
         n_results=1,
-        where={},
         include=includes,
     )
     for key in nn.keys():
@@ -329,7 +328,6 @@ def test_get_nearest_neighbors(client):
     nn = collection.query(
         query_embeddings=[[1.1, 2.3, 3.2]],
         n_results=1,
-        where={},
         include=includes,
     )
     for key in nn.keys():
@@ -343,7 +341,6 @@ def test_get_nearest_neighbors(client):
     nn = collection.query(
         query_embeddings=[[1.1, 2.3, 3.2], [0.1, 2.3, 4.5]],
         n_results=1,
-        where={},
         include=includes,
     )
     for key in nn.keys():
@@ -364,6 +361,12 @@ def test_delete(client):
     with pytest.raises(Exception):
         collection.delete()
 
+def test_delete_returns_none(client):
+    client.reset()
+    collection = client.create_collection("testspace")
+    collection.add(**batch_records)
+    assert collection.count() == 2
+    assert collection.delete(ids=batch_records["ids"]) is None
 
 def test_delete_with_index(client):
     client.reset()
@@ -445,25 +448,25 @@ def test_modify_warn_on_DF_change(client, caplog):
 def test_metadata_cru(client):
     client.reset()
     metadata_a = {"a": 1, "b": 2}
-    # Test create metatdata
+    # Test create metadata
     collection = client.create_collection("testspace", metadata=metadata_a)
     assert collection.metadata is not None
     assert collection.metadata["a"] == 1
     assert collection.metadata["b"] == 2
 
-    # Test get metatdata
+    # Test get metadata
     collection = client.get_collection("testspace")
     assert collection.metadata is not None
     assert collection.metadata["a"] == 1
     assert collection.metadata["b"] == 2
 
-    # Test modify metatdata
+    # Test modify metadata
     collection.modify(metadata={"a": 2, "c": 3})
     assert collection.metadata["a"] == 2
     assert collection.metadata["c"] == 3
     assert "b" not in collection.metadata
 
-    # Test get after modify metatdata
+    # Test get after modify metadata
     collection = client.get_collection("testspace")
     assert collection.metadata is not None
     assert collection.metadata["a"] == 2
@@ -1411,7 +1414,6 @@ def test_get_nearest_neighbors_where_n_results_more_than_element(client):
     results = collection.query(
         query_embeddings=[[1.1, 2.3, 3.2]],
         n_results=5,
-        where={},
         include=includes,
     )
     for key in results.keys():
@@ -1431,7 +1433,6 @@ def test_invalid_n_results_param(client):
         collection.query(
             query_embeddings=[[1.1, 2.3, 3.2]],
             n_results=-1,
-            where={},
             include=["embeddings", "documents", "metadatas", "distances"],
         )
     assert "Number of requested results -1, cannot be negative, or zero." in str(
@@ -1443,7 +1444,6 @@ def test_invalid_n_results_param(client):
         collection.query(
             query_embeddings=[[1.1, 2.3, 3.2]],
             n_results="one",
-            where={},
             include=["embeddings", "documents", "metadatas", "distances"],
         )
     assert "int" in str(exc.value)

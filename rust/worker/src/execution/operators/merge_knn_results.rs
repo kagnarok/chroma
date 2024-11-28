@@ -29,6 +29,7 @@ pub struct MergeKnnResultsOperatorInput {
     blockfile_provider: BlockfileProvider,
 }
 
+#[allow(dead_code)]
 impl MergeKnnResultsOperatorInput {
     pub fn new(
         hnsw_result_offset_ids: Vec<usize>,
@@ -46,12 +47,13 @@ impl MergeKnnResultsOperatorInput {
             include_vectors,
             k,
             record_segment_definition,
-            blockfile_provider: blockfile_provider,
+            blockfile_provider,
         }
     }
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct MergeKnnResultsOperatorOutput {
     pub user_ids: Vec<String>,
     pub distances: Vec<f32>,
@@ -63,7 +65,7 @@ pub enum MergeKnnResultsOperatorError {}
 
 impl ChromaError for MergeKnnResultsOperatorError {
     fn code(&self) -> ErrorCodes {
-        return ErrorCodes::UNKNOWN;
+        ErrorCodes::Unknown
     }
 }
 
@@ -104,7 +106,16 @@ impl Operator<MergeKnnResultsOperatorInput, MergeKnnResultsOperatorOutput>
                         if let Some(hnsw_result_vectors) = &mut hnsw_result_vectors {
                             let record = reader.get_data_for_offset_id(*offset_id as u32).await;
                             match record {
-                                Ok(record) => hnsw_result_vectors.push(record.embedding.to_vec()),
+                                Ok(Some(record)) => {
+                                    hnsw_result_vectors.push(record.embedding.to_vec())
+                                }
+                                Ok(None) => {
+                                    return Err(Box::new(
+                                        RecordSegmentReaderCreationError::DataRecordNotFound(
+                                            *offset_id as u32,
+                                        ),
+                                    ));
+                                }
                                 Err(e) => return Err(e),
                             }
                         }
@@ -139,6 +150,12 @@ impl Operator<MergeKnnResultsOperatorInput, MergeKnnResultsOperatorOutput>
                         return Err(e);
                     }
                     RecordSegmentReaderCreationError::InvalidNumberOfFiles => {
+                        return Err(e);
+                    }
+                    RecordSegmentReaderCreationError::DataRecordNotFound(_) => {
+                        return Err(e);
+                    }
+                    RecordSegmentReaderCreationError::UserRecordNotFound(_) => {
                         return Err(e);
                     }
                     RecordSegmentReaderCreationError::UninitializedSegment => {
@@ -183,13 +200,14 @@ impl Operator<MergeKnnResultsOperatorInput, MergeKnnResultsOperatorOutput>
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_results(
-    hnsw_result_user_ids: &Vec<&str>,
-    hnsw_result_distances: &Vec<f32>,
+    hnsw_result_user_ids: &[&str],
+    hnsw_result_distances: &[f32],
     hnsw_result_vectors: &Option<Vec<Vec<f32>>>,
-    brute_force_result_user_ids: &Vec<String>,
-    brute_force_result_distances: &Vec<f32>,
-    brute_force_result_vectors: &Vec<Vec<f32>>,
+    brute_force_result_user_ids: &[String],
+    brute_force_result_distances: &[f32],
+    brute_force_result_vectors: &[Vec<f32>],
     include_vectors: bool,
     k: usize,
 ) -> (Vec<String>, Vec<f32>, Option<Vec<Vec<f32>>>) {
@@ -205,7 +223,7 @@ fn merge_results(
     let mut brute_force_index = 0;
 
     // TODO: This doesn't have to clone the user IDs, but it's easier for now
-    while (result_user_ids.len() <= k)
+    while (result_user_ids.len() < k)
         && (hnsw_index < hnsw_result_user_ids.len()
             || brute_force_index < brute_force_result_user_ids.len())
     {

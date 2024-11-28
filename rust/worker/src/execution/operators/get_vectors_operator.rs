@@ -17,7 +17,7 @@ pub struct GetVectorsOperator {}
 
 impl GetVectorsOperator {
     pub fn new() -> Box<Self> {
-        return Box::new(GetVectorsOperator {});
+        Box::new(GetVectorsOperator {})
     }
 }
 
@@ -42,12 +42,12 @@ impl GetVectorsOperatorInput {
         log_records: Chunk<LogRecord>,
         search_user_ids: Vec<String>,
     ) -> Self {
-        return GetVectorsOperatorInput {
+        GetVectorsOperatorInput {
             record_segment_definition,
             blockfile_provider,
             log_records,
             search_user_ids,
-        };
+        }
     }
 }
 
@@ -66,13 +66,13 @@ pub struct GetVectorsOperatorOutput {
 #[derive(Debug, Error)]
 pub enum GetVectorsOperatorError {
     #[error("Error creating record segment reader {0}")]
-    RecordSegmentReaderCreationError(
+    RecordSegmentReaderCreation(
         #[from] crate::segment::record_segment::RecordSegmentReaderCreationError,
     ),
     #[error(transparent)]
-    RecordSegmentReaderError(#[from] Box<dyn ChromaError>),
+    RecordSegmentReader(#[from] Box<dyn ChromaError>),
     #[error("Error materializing logs {0}")]
-    LogMaterializationError(#[from] LogMaterializerError),
+    LogMaterialization(#[from] LogMaterializerError),
 }
 
 impl ChromaError for GetVectorsOperatorError {
@@ -106,14 +106,16 @@ impl Operator<GetVectorsOperatorInput, GetVectorsOperatorOutput> for GetVectorsO
             Err(e) => match *e {
                 record_segment::RecordSegmentReaderCreationError::UninitializedSegment => None,
                 record_segment::RecordSegmentReaderCreationError::BlockfileOpenError(_) => {
-                    return Err(GetVectorsOperatorError::RecordSegmentReaderCreationError(
-                        *e,
-                    ))
+                    return Err(GetVectorsOperatorError::RecordSegmentReaderCreation(*e))
                 }
                 record_segment::RecordSegmentReaderCreationError::InvalidNumberOfFiles => {
-                    return Err(GetVectorsOperatorError::RecordSegmentReaderCreationError(
-                        *e,
-                    ))
+                    return Err(GetVectorsOperatorError::RecordSegmentReaderCreation(*e))
+                }
+                record_segment::RecordSegmentReaderCreationError::DataRecordNotFound(_) => {
+                    return Err(GetVectorsOperatorError::RecordSegmentReaderCreation(*e))
+                }
+                record_segment::RecordSegmentReaderCreationError::UserRecordNotFound(_) => {
+                    return Err(GetVectorsOperatorError::RecordSegmentReaderCreation(*e))
                 }
             },
         };
@@ -126,7 +128,7 @@ impl Operator<GetVectorsOperatorInput, GetVectorsOperatorOutput> for GetVectorsO
         let mat_records = match materializer.materialize().await {
             Ok(records) => records,
             Err(e) => {
-                return Err(GetVectorsOperatorError::LogMaterializationError(e));
+                return Err(GetVectorsOperatorError::LogMaterialization(e));
             }
         };
 
@@ -155,9 +157,10 @@ impl Operator<GetVectorsOperatorInput, GetVectorsOperatorOutput> for GetVectorsO
                 for user_id in remaining_search_user_ids.iter() {
                     let read_data = reader.get_data_and_offset_id_for_user_id(user_id).await;
                     match read_data {
-                        Ok((record, _)) => {
+                        Ok(Some((record, _))) => {
                             output_vectors.insert(record.id.to_string(), record.embedding.to_vec());
                         }
+                        Ok(None) => {}
                         Err(_) => {
                             // If the user id is not found in the record segment, we do not add it to the output
                         }

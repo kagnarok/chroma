@@ -93,7 +93,7 @@ export type QueryResponse = SingleQueryResponse | MultiQueryResponse;
 
 export type AddResponse = {};
 
-export interface Collection {
+export interface CollectionParams {
   name: string;
   id: string;
   metadata: CollectionMetadata | undefined;
@@ -257,4 +257,9 @@ export type DeleteParams = {
   ids?: ID | IDs;
   where?: Where;
   whereDocument?: WhereDocument;
+};
+
+export type UserIdentity = {
+  tenant: string;
+  databases: string[];
 };

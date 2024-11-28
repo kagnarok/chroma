@@ -2,11 +2,11 @@ use crate::{system::ReceiverForMessage, utils::get_panic_message};
 use async_trait::async_trait;
 use chroma_error::{ChromaError, ErrorCodes};
 use futures::FutureExt;
-use std::{fmt::Debug, panic::AssertUnwindSafe};
+use std::{any::type_name, fmt::Debug, panic::AssertUnwindSafe};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub(crate) enum OperatorType {
+pub enum OperatorType {
     IO,
     Other,
 }
@@ -14,7 +14,7 @@ pub(crate) enum OperatorType {
 /// An operator takes a generic input and returns a generic output.
 /// It is a definition of a function.
 #[async_trait]
-pub(super) trait Operator<I, O>: Send + Sync + Debug
+pub trait Operator<I, O>: Send + Sync + Debug
 where
     I: Send + Sync,
     O: Send + Sync,
@@ -23,7 +23,9 @@ where
     // It would have been nice to do this with a default trait for result
     // but that's not stable in rust yet.
     async fn run(&self, input: &I) -> Result<O, Self::Error>;
-    fn get_name(&self) -> &'static str;
+    fn get_name(&self) -> &'static str {
+        type_name::<Self>()
+    }
     fn get_type(&self) -> OperatorType {
         OperatorType::Other
     }
@@ -124,6 +126,10 @@ where
 
         match result {
             Ok(result) => {
+                if let Err(err) = result.as_ref() {
+                    tracing::error!("Task {} failed with error: {:?}", self.task_id, err);
+                }
+
                 // If this (or similarly, the .send() below) errors, it means the receiver was dropped.
                 // There are valid reasons for this to happen (e.g. the component was stopped) so we ignore the error.
                 // Another valid case is when the PrefetchIoOperator finishes
@@ -296,7 +302,7 @@ mod tests {
         let results_guard = received_results.lock();
         let result = &results_guard.first().unwrap().result;
 
-        assert_eq!(result.is_err(), true);
-        matches!(result, Err(TaskError::Panic(Some(msg))) if *msg == "MockOperator panicking".to_string());
+        assert!(result.is_err());
+        matches!(result, Err(TaskError::Panic(Some(msg))) if msg == "MockOperator panicking");
     }
 }

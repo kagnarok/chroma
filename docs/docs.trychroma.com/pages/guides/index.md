@@ -84,7 +84,7 @@ await client.reset() # Empties and completely resets the database. ⚠️ This i
 
 Chroma can also be configured to run in client/server mode. In this mode, the Chroma client connects to a Chroma server running in a separate process.
 
-To start the Chroma server, run the following command:
+To start the Chroma server locally, run the following command:
 
 ```bash
 chroma run --path /db_path
@@ -165,7 +165,7 @@ To run Chroma in client server mode, first install the chroma library and CLI vi
 pip install chromadb
 ```
 
-Then start the Chroma server:
+Then start the Chroma server locally:
 
 ```bash
 chroma run --path /db_path
@@ -183,7 +183,7 @@ import { ChromaClient } from "chromadb";
 const client = new ChromaClient();
 ```
 
-You can also run the Chroma server in a docker container, or deployed to a cloud provider. See the [deployment docs](./deployment.md) for more information.
+You can also run the Chroma server in a docker container, or deployed to a cloud provider. See the [deployment docs](./deployment/docker) for more information.
 
 {% /tab %}
 
@@ -297,8 +297,8 @@ collection.modify(name="new_name") # Rename the collection
 There are a few useful convenience methods for working with Collections.
 
 ```javascript
-await client.peekRecords(collection); // returns a list of the first 10 items in the collection
-await client.countRecords(collection); // returns the number of items in the collection
+await collection.peek(); // returns a list of the first 10 items in the collection
+await collection.count(); // returns the number of items in the collection
 ```
 
 {% /tab %}
@@ -371,7 +371,7 @@ Add data to Chroma with `.addRecords`.
 Raw documents:
 
 ```javascript
-await client.addRecords(collection, {
+await collection.add({
     ids: ["id1", "id2", "id3", ...],
     metadatas: [{"chapter": "3", "verse": "16"}, {"chapter": "3", "verse": "5"}, {"chapter": "29", "verse": "11"}, ...],
     documents: ["lorem ipsum...", "doc2", "doc3", ...],
@@ -409,7 +409,7 @@ collection.add(
 {% tab label="Javascript" %}
 
 ```javascript
-await client.addRecords(collection, {
+await collection.add({
     ids: ["id1", "id2", "id3", ...],
     embeddings: [[1.1, 2.3, 3.2], [4.5, 6.9, 4.4], [1.1, 2.3, 3.2], ...],
     metadatas: [{"chapter": "3", "verse": "16"}, {"chapter": "3", "verse": "5"}, {"chapter": "29", "verse": "11"}, ...],
@@ -441,7 +441,7 @@ collection.add(
 {% tab label="Javascript" %}
 
 ```javascript
-await client.addRecords(collection, {
+await collection.add({
     ids: ["id1", "id2", "id3", ...],
     embeddings: [[1.1, 2.3, 3.2], [4.5, 6.9, 4.4], [1.1, 2.3, 3.2], ...],
     metadatas: [{"chapter": "3", "verse": "16"}, {"chapter": "3", "verse": "5"}, {"chapter": "29", "verse": "11"}, ...],
@@ -476,7 +476,7 @@ collection.query(
 Chroma collections can be queried in a variety of ways, using the `.queryRecords` method.
 
 ```javascript
-const result = await client.queryRecords(collection, {
+const result = await collection.query({
     queryEmbeddings: [[11.1, 12.1, 13.1],[1.1, 2.3, 3.2], ...],
     nResults: 10,
     where: {"metadata_field": "is_equal_to_this"},
@@ -525,7 +525,7 @@ collection.get(
 {% tab label="Javascript" %}
 
 ```javascript
-await client.queryRecords(collection, {
+await collection.query({
     nResults: 10, // n_results
     where: {"metadata_field": "is_equal_to_this"}, // where
     queryTexts: ["doc10", "thus spake zarathustra", ...], // query_text
@@ -535,7 +535,7 @@ await client.queryRecords(collection, {
 You can also retrieve records from a collection by `id` using `.getRecords`.
 
 ```javascript
-await client.getRecords(collection, {
+await collection.get( {
 	ids: ["id1", "id2", "id3", ...], //ids
 	where: {"style": "style1"} // where
 })
@@ -549,7 +549,7 @@ await client.getRecords(collection, {
 
 ##### Choosing which data is returned
 
-When using get or query you can use the include parameter to specify which data you want returned - any of `embeddings`, `documents`, `metadatas`, and for query, `distances`. By default, Chroma will return the `documents`, `metadatas` and in the case of query, the `distances` of the results. `embeddings` are excluded by default for performance and the `ids` are always returned. You can specify which of these you want returned by passing an array of included field names to the includes parameter of the query or get method.
+When using get or query you can use the include parameter to specify which data you want returned - any of `embeddings`, `documents`, `metadatas`, and for query, `distances`. By default, Chroma will return the `documents`, `metadatas` and in the case of query, the `distances` of the results. `embeddings` are excluded by default for performance and the `ids` are always returned. You can specify which of these you want returned by passing an array of included field names to the includes parameter of the query or get method. Note that embeddings will be returned as a 2-d numpy array in `.get` and a python list of 2-d numpy arrays in `.query`.
 
 {% tabs group="code-lang" hideTabs=true %}
 {% tab label="Python" %}
@@ -571,11 +571,11 @@ collection.query(
 
 ```javascript
 # Only get documents and ids
-client.getRecords(collection,
+collection.get(
     {include=["documents"]}
 )
 
-client.getRecords(collection, {
+collection.get({
     queryEmbeddings=[[11.1, 12.1, 13.1],[1.1, 2.3, 3.2], ...],
     include=["documents"]
 })
@@ -753,8 +753,7 @@ collection.update(
 Any property of records in a collection can be updated using `.updateRecords`.
 
 ```javascript
-client.updateRecords(
-    collection,
+collection.update(
     {
       ids: ["id1", "id2", "id3", ...],
       embeddings: [[1.1, 2.3, 3.2], [4.5, 6.9, 4.4], [1.1, 2.3, 3.2], ...],
@@ -790,7 +789,7 @@ collection.upsert(
 {% tab label="Javascript" %}
 
 ```javascript
-await client.upsertRecords(collection, {
+await collection.upsert({
   ids: ["id1", "id2", "id3"],
   embeddings: [
     [1.1, 2.3, 3.2],
@@ -831,7 +830,7 @@ collection.delete(
 {% tab label="Javascript" %}
 
 ```javascript
-await client.deleteRecords(collection, {
+await collection.delete({
     ids: ["id1", "id2", "id3",...], //ids
 	where: {"chapter": "20"} //where
 })

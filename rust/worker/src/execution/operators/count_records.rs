@@ -109,6 +109,12 @@ impl Operator<CountRecordsInput, CountRecordsOutput> for CountRecordsOperator {
                     RecordSegmentReaderCreationError::InvalidNumberOfFiles => {
                         return Err(CountRecordsError::RecordSegmentCreateError(*e));
                     }
+                    RecordSegmentReaderCreationError::DataRecordNotFound(_) => {
+                        return Err(CountRecordsError::RecordSegmentCreateError(*e));
+                    }
+                    RecordSegmentReaderCreationError::UserRecordNotFound(_) => {
+                        return Err(CountRecordsError::RecordSegmentCreateError(*e));
+                    }
                 }
             }
         };
@@ -204,19 +210,18 @@ mod tests {
         segment::{record_segment::RecordSegmentWriter, SegmentWriter},
     };
     use chroma_blockstore::provider::BlockfileProvider;
-    use chroma_types::{Chunk, LogRecord, Operation, OperationRecord};
+    use chroma_types::{Chunk, CollectionUuid, LogRecord, Operation, OperationRecord, SegmentUuid};
     use std::{collections::HashMap, str::FromStr};
     use tracing::{Instrument, Span};
-    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_merge_log_and_storage() {
         let in_memory_provider = BlockfileProvider::new_memory();
         let mut record_segment = chroma_types::Segment {
-            id: Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
+            id: SegmentUuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
             r#type: chroma_types::SegmentType::BlockfileRecord,
             scope: chroma_types::SegmentScope::RECORD,
-            collection: Uuid::from_str("00000000-0000-0000-0000-000000000000")
+            collection: CollectionUuid::from_str("00000000-0000-0000-0000-000000000000")
                 .expect("parse error"),
             metadata: None,
             file_path: HashMap::new(),
@@ -262,29 +267,32 @@ mod tests {
                 },
             ];
             let data: Chunk<LogRecord> = Chunk::new(data.into());
-            let mut record_segment_reader: Option<RecordSegmentReader> = None;
-            match RecordSegmentReader::from_segment(&record_segment, &in_memory_provider).await {
-                Ok(reader) => {
-                    record_segment_reader = Some(reader);
-                }
-                Err(e) => {
-                    match *e {
-                        // Uninitialized segment is fine and means that the record
-                        // segment is not yet initialized in storage.
-                        RecordSegmentReaderCreationError::UninitializedSegment => {
-                            record_segment_reader = None;
+            let record_segment_reader: Option<RecordSegmentReader> =
+                match RecordSegmentReader::from_segment(&record_segment, &in_memory_provider).await
+                {
+                    Ok(reader) => Some(reader),
+                    Err(e) => {
+                        match *e {
+                            // Uninitialized segment is fine and means that the record
+                            // segment is not yet initialized in storage.
+                            RecordSegmentReaderCreationError::UninitializedSegment => None,
+                            RecordSegmentReaderCreationError::BlockfileOpenError(_) => {
+                                panic!(
+                                    "Error creating record segment reader. Blockfile open error."
+                                );
+                            }
+                            RecordSegmentReaderCreationError::InvalidNumberOfFiles => {
+                                panic!("Error creating record segment reader. Invalid number of files.");
+                            }
+                            RecordSegmentReaderCreationError::DataRecordNotFound(_) => {
+                                panic!("Error creating record segment reader");
+                            }
+                            RecordSegmentReaderCreationError::UserRecordNotFound(_) => {
+                                panic!("Error creating record segment reader");
+                            }
                         }
-                        RecordSegmentReaderCreationError::BlockfileOpenError(_) => {
-                            panic!("Error creating record segment reader. Blockfile open error.");
-                        }
-                        RecordSegmentReaderCreationError::InvalidNumberOfFiles => {
-                            panic!(
-                                "Error creating record segment reader. Invalid number of files."
-                            );
-                        }
-                    };
-                }
-            };
+                    }
+                };
             let materializer = LogMaterializer::new(record_segment_reader, data, None);
             let mat_records = materializer
                 .materialize()
@@ -297,6 +305,7 @@ mod tests {
                 .expect("Apply materializated log failed");
             let flusher = segment_writer
                 .commit()
+                .await
                 .expect("Commit for segment writer failed");
             record_segment.file_path = flusher.flush().await.expect("Flush segment writer failed");
         }
@@ -353,10 +362,10 @@ mod tests {
     async fn test_no_compaction_log_only() {
         let in_memory_provider = BlockfileProvider::new_memory();
         let record_segment = chroma_types::Segment {
-            id: Uuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
+            id: SegmentUuid::from_str("00000000-0000-0000-0000-000000000000").expect("parse error"),
             r#type: chroma_types::SegmentType::BlockfileRecord,
             scope: chroma_types::SegmentScope::RECORD,
-            collection: Uuid::from_str("00000000-0000-0000-0000-000000000000")
+            collection: CollectionUuid::from_str("00000000-0000-0000-0000-000000000000")
                 .expect("parse error"),
             metadata: None,
             file_path: HashMap::new(),

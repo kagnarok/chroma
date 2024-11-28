@@ -1,12 +1,13 @@
 use super::{
     reader_writer::{MemoryBlockfileReader, MemoryBlockfileWriter},
-    storage::{Readable, StorageManager, Writeable},
+    storage::{Readable, StorageManager},
 };
 use crate::{
-    arrow::types::{ArrowReadableKey, ArrowReadableValue, ArrowWriteableKey, ArrowWriteableValue},
-    key::KeyWrapper,
+    arrow::types::{ArrowReadableKey, ArrowReadableValue},
+    key::{InvalidKeyConversion, KeyWrapper},
     provider::{CreateError, OpenError},
-    BlockfileReader, BlockfileWriter, Key, Value,
+    BlockfileReader, BlockfileWriter, BlockfileWriterMutationOrdering, BlockfileWriterOptions, Key,
+    Value,
 };
 
 /// A BlockFileProvider that creates HashMapBlockfiles (in-memory blockfiles used for testing).
@@ -14,7 +15,7 @@ use crate::{
 /// # Note
 /// This is not intended for production use.
 #[derive(Clone)]
-pub(crate) struct MemoryBlockfileProvider {
+pub struct MemoryBlockfileProvider {
     storage_manager: StorageManager,
 }
 
@@ -25,9 +26,13 @@ impl MemoryBlockfileProvider {
         }
     }
 
-    pub(crate) fn open<
+    pub(crate) fn read<
         'new,
-        K: Key + Into<KeyWrapper> + From<&'new KeyWrapper> + ArrowReadableKey<'new> + 'new,
+        K: Key
+            + Into<KeyWrapper>
+            + TryFrom<&'new KeyWrapper, Error = InvalidKeyConversion>
+            + ArrowReadableKey<'new>
+            + 'new,
         V: Value + Readable<'new> + ArrowReadableValue<'new> + 'new,
     >(
         &self,
@@ -37,23 +42,25 @@ impl MemoryBlockfileProvider {
         Ok(BlockfileReader::<K, V>::MemoryBlockfileReader(reader))
     }
 
-    pub(crate) fn create<
-        'new,
-        K: Key + Into<KeyWrapper> + ArrowWriteableKey + 'new,
-        V: Value + Writeable + ArrowWriteableValue + 'new,
-    >(
+    pub(crate) fn write(
         &self,
+        options: BlockfileWriterOptions,
     ) -> Result<BlockfileWriter, Box<CreateError>> {
+        if options.mutation_ordering != BlockfileWriterMutationOrdering::Unordered {
+            unimplemented!();
+        }
+
+        if options.fork_from.is_some() {
+            unimplemented!();
+        }
+
         let writer: MemoryBlockfileWriter =
             MemoryBlockfileWriter::new(self.storage_manager.clone());
         Ok(BlockfileWriter::MemoryBlockfileWriter(writer))
     }
 
-    pub(crate) fn fork<K: Key + ArrowWriteableKey, V: Value + ArrowWriteableValue>(
-        &self,
-        id: &uuid::Uuid,
-    ) -> Result<BlockfileWriter, Box<CreateError>> {
-        todo!();
+    pub(crate) fn clear(&self) {
+        self.storage_manager.clear();
     }
 }
 
@@ -101,7 +108,7 @@ mod tests {
             },
         ];
         let data: Chunk<LogRecord> = Chunk::new(data.into());
-        let data_records = data
+        let _data_records = data
             .iter()
             .map(|record| DataRecord {
                 id: &record.0.record.id,
@@ -111,7 +118,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let provider = MemoryBlockfileProvider::new();
+        let _provider = MemoryBlockfileProvider::new();
         // let mut writer = provider.create::<&str, DataRecord>().unwrap();
         // let id = writer.id();
         // for record in data_records {

@@ -5,6 +5,7 @@ from chromadb.api.configuration import (
     EmbeddingsQueueConfigurationInternal,
 )
 from chromadb.db.base import SqlDB, ParameterValue, get_sql
+from chromadb.errors import BatchSizeExceededError
 from chromadb.ingest import (
     Producer,
     Consumer,
@@ -149,6 +150,9 @@ class SqlEmbeddingsQueue(SqlDB, Producer, Consumer):
             .on(segments_t.id == Table("max_seq_id").segment_id)
         )
 
+        topic_name = create_topic_name(
+            self._tenant, self._topic_namespace, collection_id
+        )
         with self.tx() as cur:
             sql, params = get_sql(segment_ids_q, self.parameter_format())
             cur.execute(sql, params)
@@ -163,6 +167,7 @@ class SqlEmbeddingsQueue(SqlDB, Producer, Consumer):
                 self.querybuilder()
                 .from_(t)
                 .where(t.seq_id < ParameterValue(min_seq_id))
+                .where(t.topic == ParameterValue(topic_name))
                 .delete()
             )
 
@@ -191,12 +196,12 @@ class SqlEmbeddingsQueue(SqlDB, Producer, Consumer):
             return []
 
         if len(embeddings) > self.max_batch_size:
-            raise ValueError(
+            raise BatchSizeExceededError(
                 f"""
-                    Cannot submit more than {self.max_batch_size:,} embeddings at once.
-                    Please submit your embeddings in batches of size
-                    {self.max_batch_size:,} or less.
-                    """
+                Cannot submit more than {self.max_batch_size:,} embeddings at once.
+                Please submit your embeddings in batches of size
+                {self.max_batch_size:,} or less.
+                """
             )
 
         # This creates the persisted configuration if it doesn't exist.
@@ -343,7 +348,7 @@ class SqlEmbeddingsQueue(SqlDB, Producer, Consumer):
     def _prepare_vector_encoding_metadata(
         self, embedding: OperationRecord
     ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
-        if embedding["embedding"]:
+        if embedding["embedding"] is not None:
             encoding_type = cast(ScalarEncoding, embedding["encoding"])
             encoding = encoding_type.value
             embedding_bytes = encode_vector(embedding["embedding"], encoding_type)

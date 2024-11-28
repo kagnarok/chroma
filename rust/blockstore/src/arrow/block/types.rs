@@ -1,4 +1,8 @@
-use super::delta::BlockDelta;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::io::SeekFrom;
+use std::ops::{Bound, RangeBounds};
+
 use crate::arrow::types::{ArrowReadableKey, ArrowReadableValue};
 use arrow::array::ArrayData;
 use arrow::buffer::Buffer;
@@ -10,12 +14,63 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use chroma_error::{ChromaError, ErrorCodes};
-use std::cmp::Ordering::{Equal, Greater, Less};
-use std::io::SeekFrom;
+use serde::de::Error as DeError;
+use serde::ser::Error as SerError;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::delta::UnorderedBlockDelta;
+
 const ARROW_ALIGNMENT: usize = 64;
+
+/// A RecordBatchWrapper looks like a record batch, but also implements serde's Serialize and
+/// Deserialize.
+#[derive(Clone, Debug)]
+#[repr(transparent)]
+pub struct RecordBatchWrapper(pub RecordBatch);
+
+impl std::ops::Deref for RecordBatchWrapper {
+    type Target = RecordBatch;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for RecordBatchWrapper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<RecordBatch> for RecordBatchWrapper {
+    fn from(rb: RecordBatch) -> Self {
+        Self(rb)
+    }
+}
+
+impl Serialize for RecordBatchWrapper {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let data = Block::record_batch_to_bytes(self).map_err(S::Error::custom)?;
+        serializer.serialize_bytes(&data)
+    }
+}
+
+impl<'de> Deserialize<'de> for RecordBatchWrapper {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let data = Vec::<u8>::deserialize(deserializer)?;
+        let reader = std::io::Cursor::new(data);
+        let rb = Block::load_record_batch(reader, false).map_err(D::Error::custom)?;
+        Ok(RecordBatchWrapper(rb))
+    }
+}
 
 /// A block in a blockfile. A block is a sorted collection of data that is immutable once it has been committed.
 /// Blocks are the fundamental unit of storage in the blockstore and are used to store data in the form of (key, value) pairs.
@@ -28,25 +83,26 @@ const ARROW_ALIGNMENT: usize = 64;
 /// A Block holds BlockData via its Inner. Conceptually, the BlockData being loaded into memory is an optimization. The Block interface
 /// could also support out of core operations where the BlockData is loaded from disk on demand. Currently we force operations to be in-core
 /// but could expand to out-of-core in the future.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Block {
     // The data is stored in an Arrow record batch with the column schema (prefix, key, value).
     // These are stored in sorted order by prefix and key for efficient lookups.
-    pub data: RecordBatch,
+    pub data: RecordBatchWrapper,
     pub id: Uuid,
 }
 
 impl Block {
     /// Create a concrete block from an id and the underlying record batch of data
     pub fn from_record_batch(id: Uuid, data: RecordBatch) -> Self {
+        let data = data.into();
         Self { id, data }
     }
 
     /// Converts the block to a block delta for writing to a new block
     pub fn to_block_delta<'me, K: ArrowReadableKey<'me>, V: ArrowReadableValue<'me>>(
         &'me self,
-        mut delta: BlockDelta,
-    ) -> BlockDelta {
+        mut delta: UnorderedBlockDelta,
+    ) -> UnorderedBlockDelta {
         let prefix_arr = self
             .data
             .column(0)
@@ -58,51 +114,211 @@ impl Block {
             let key = K::get(self.data.column(1), i);
             let value = V::get(self.data.column(2), i);
 
-            K::add_to_delta(prefix, key, value, &mut delta);
+            K::add_to_delta(prefix, key, value, &mut delta.builder);
         }
         delta
     }
 
-    fn binary_search<'me, K: ArrowReadableKey<'me>, V: ArrowReadableValue<'me>>(
+    /// Binary searches this slice with a comparator function.
+    ///
+    /// The comparator function should return an order code that indicates
+    /// whether its argument is `Less`, `Equal` or `Greater` the desired
+    /// target.
+    /// If the slice is not sorted or if the comparator function does not
+    /// implement an order consistent with the sort order of the underlying
+    /// slice, the returned result is unspecified and meaningless.
+    ///
+    /// If the value is found then [`Result::Ok`] is returned, containing the
+    /// index of the matching element. If there are multiple matches, then any
+    /// one of the matches could be returned. The index is chosen
+    /// deterministically, but is subject to change in future versions of Rust.
+    /// If the value is not found then [`Result::Err`] is returned, containing
+    /// the index where a matching element could be inserted while maintaining
+    /// sorted order.
+    ///
+    // The implementation is a binary search based on [`std::slice::binary_search_by`]
+    //
+    // [`std::slice::binary_search_by`]: https://github.com/rust-lang/rust/blob/705cfe0e966399e061d64dd3661bfbc57553ed87/library/core/src/slice/mod.rs#L2731-L2827
+    // Retrieval timestamp: Nov 1, 2024
+    // Source commit hash: a0215d8e46aab41219dea0bb1cbaaf97dafe2f89
+    // Source license: Apache-2.0 or MIT
+    #[inline]
+    fn binary_search_by<'me, K: ArrowReadableKey<'me>, F>(
         &'me self,
-        prefix: &str,
-        key: K,
-    ) -> Option<V> {
-        // Copied from std lib https://doc.rust-lang.org/src/core/slice/mod.rs.html#2786
-        // and modified for two nested level comparisons.
+        mut f: F,
+    ) -> Result<usize, usize>
+    where
+        F: FnMut((&'me str, K)) -> Ordering,
+    {
         let mut size = self.len();
-        let mut left = 0;
-        let mut right = size;
-        let prefix_arr = self
+        if size == 0 {
+            return Err(0);
+        }
+
+        let prefix_array = self
             .data
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        while left < right {
-            let mid = left + size / 2;
+        let mut base = 0;
 
-            let prefix_cmp = prefix_arr.value(mid).cmp(prefix);
-            // This control flow produces conditional moves, which results in
-            // fewer branches and instructions than if/else or matching on
-            // cmp::Ordering.
-            // This is x86 asm for u8: https://rust.godbolt.org/z/698eYffTx.
-            left = if prefix_cmp == Less { mid + 1 } else { left };
-            right = if prefix_cmp == Greater { mid } else { right };
-            if prefix_cmp == Equal {
-                let key_cmp = K::get(self.data.column(1), mid)
-                    .partial_cmp(&key)
-                    .expect("NaN not expected"); // NaN not expected
-                left = if key_cmp == Less { mid + 1 } else { left };
-                right = if key_cmp == Greater { mid } else { right };
-                if key_cmp == Equal {
-                    return Some(V::get(self.data.column(2), mid));
-                }
-            }
+        // This loop intentionally doesn't have an early exit if the comparison
+        // returns Equal. We want the number of loop iterations to depend *only*
+        // on the size of the input slice so that the CPU can reliably predict
+        // the loop count.
+        while size > 1 {
+            let half = size / 2;
+            let mid = base + half;
 
-            size = right - left;
+            // SAFETY: the call is made safe by the following inconstants:
+            // - `mid >= 0`: by definition
+            // - `mid < size`: `mid = size / 2 + size / 4 + size / 8 ...`
+            let prefix = prefix_array.value(mid);
+            let key = K::get(self.data.column(1), mid);
+            let cmp = f((prefix, key));
+
+            base = if cmp == Ordering::Greater { base } else { mid };
+
+            // This is imprecise in the case where `size` is odd and the
+            // comparison returns Greater: the mid element still gets included
+            // by `size` even though it's known to be larger than the element
+            // being searched for.
+            //
+            // This is fine though: we gain more performance by keeping the
+            // loop iteration count invariant (and thus predictable) than we
+            // lose from considering one additional element.
+            size -= half;
         }
-        None
+
+        // SAFETY: base is always in [0, size) because base <= mid.
+        let prefix = prefix_array.value(base);
+        let key = K::get(self.data.column(1), base);
+        let cmp = f((prefix, key));
+        if cmp == Ordering::Equal {
+            Ok(base)
+        } else {
+            let result = base + (cmp == Ordering::Less) as usize;
+            Err(result)
+        }
+    }
+
+    /// Returns the largest index where `prefixes[index] == prefix` or None if the provided prefix does not exist in the block.
+    #[inline]
+    fn find_largest_index_of_prefix<'me, K: ArrowReadableKey<'me>>(
+        &'me self,
+        prefix: &str,
+    ) -> Option<usize> {
+        // By design, will never find an exact match (comparator never evaluates to Equal). This finds the index of the first element that is greater than the prefix. If no element is greater, it returns the length of the array.
+        let result = self
+            .binary_search_by::<K, _>(|(p, _)| match p.cmp(prefix) {
+                Ordering::Less => Ordering::Less,
+                Ordering::Equal => Ordering::Less,
+                Ordering::Greater => Ordering::Greater,
+            })
+            .expect_err("Never returns Ok because the comparator never evaluates to Equal.");
+
+        if result == 0 {
+            // The first element is greater than the target prefix, so the target prefix does not exist in the block. (Or the block is empty.)
+            return None;
+        }
+
+        let prefix_array = self
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        // `result` is the first index where the prefix is larger than the input (or the length of the array) so we want one element before this.
+        match prefix_array.value(result - 1).cmp(prefix) {
+            // We're at the end of the array, so the prefix does not exist in the block (all values are less than the prefix)
+            Ordering::Less => None,
+            // The prefix exists
+            Ordering::Equal => Some(result - 1),
+            // This is impossible
+            Ordering::Greater => None,
+        }
+    }
+
+    /// Returns the smallest index where `prefixes[index] == prefix` or None if the provided prefix does not exist in the block.
+    #[inline]
+    fn find_smallest_index_of_prefix<'me, K: ArrowReadableKey<'me>>(
+        &'me self,
+        prefix: &str,
+    ) -> Option<usize> {
+        let result = self
+            .binary_search_by::<K, _>(|(p, _)| match p.cmp(prefix) {
+                Ordering::Less => Ordering::Less,
+                Ordering::Equal => Ordering::Greater,
+                Ordering::Greater => Ordering::Greater,
+            })
+            .expect_err("Never returns Ok because the comparator never evaluates to Equal.");
+
+        let prefix_array = self
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        if result == self.len() {
+            // The target prefix is greater than all elements in the block.
+            return None;
+        }
+
+        match prefix_array.value(result).cmp(prefix) {
+            Ordering::Greater => None,
+            Ordering::Less => None,
+            Ordering::Equal => Some(result),
+        }
+    }
+
+    /// Finds the partition point of the prefix and key.
+    /// Returns the index of the first element that matches the target prefix and key. If no element matches, returns the index at which the target prefix and key could be inserted to maintain sorted order.
+    #[inline]
+    fn binary_search_prefix_key<'me, K: ArrowReadableKey<'me>>(
+        &'me self,
+        prefix: &str,
+        key: &K,
+    ) -> usize {
+        // By design, will never find an exact match (comparator never evaluates to Equal). This finds the index of the first element that matches the target prefix and key. If no element matches, it returns the index at which the target prefix and key could be inserted to maintain sorted order.
+        self.binary_search_by::<K, _>(|(p, k)| {
+            match p.cmp(prefix).then_with(|| {
+                k.partial_cmp(key)
+                    // The key type does not have a total order because of floating point values.
+                    // But in our case NaN is not allowed, so we should always have total order.
+                    .expect("Array values should be comparable.")
+            }) {
+                Ordering::Less => Ordering::Less,
+                Ordering::Equal => Ordering::Greater,
+                Ordering::Greater => Ordering::Greater,
+            }
+        })
+        .expect_err("Never returns Ok because the comparator never evaluates to Equal.")
+    }
+
+    #[inline]
+    fn match_prefix_key_at_index<'me, K: ArrowReadableKey<'me>>(
+        &'me self,
+        prefix: &str,
+        key: &K,
+        index: usize,
+    ) -> bool {
+        let prefix_array = self
+            .data
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        index < self.len()
+            && matches!(
+                (
+                    prefix_array.value(index).cmp(prefix),
+                    K::get(self.data.column(1), index).partial_cmp(key),
+                ),
+                (Ordering::Equal, Some(Ordering::Equal))
+            )
     }
 
     /*
@@ -117,134 +333,89 @@ impl Block {
         prefix: &str,
         key: K,
     ) -> Option<V> {
-        self.binary_search(prefix, key)
+        match self.binary_search_by::<K, _>(|(p, k)| {
+            p.cmp(prefix).then_with(|| {
+                k.partial_cmp(&key)
+                    // The key type does not have a total order because of floating point values.
+                    // But in our case NaN is not allowed, so we should always have total order.
+                    .expect("Array values should be comparable.")
+            })
+        }) {
+            Ok(index) => Some(V::get(self.data.column(2), index)),
+            Err(_) => None,
+        }
     }
 
-    /// Get all the values for a given prefix in the block
+    /// Get all the values for a given prefix & key range in the block
     /// ### Panics
     /// - If the underlying data types are not the same as the types specified in the function signature
-    pub fn get_prefix<'me, K: ArrowReadableKey<'me>, V: ArrowReadableValue<'me>>(
+    /// - If at least one end of the prefix range is excluded (currently unsupported)
+    pub fn get_range<
+        'prefix,
+        'me,
+        K: ArrowReadableKey<'me>,
+        V: ArrowReadableValue<'me>,
+        PrefixRange,
+        KeyRange,
+    >(
         &'me self,
-        prefix: &str,
-    ) -> Option<Vec<(&str, K, V)>> {
-        let prefix_array = self
-            .data
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let mut res: Vec<(&str, K, V)> = vec![];
-        for i in 0..self.data.num_rows() {
-            let curr_prefix = prefix_array.value(i);
-            if curr_prefix == prefix {
-                res.push((
-                    curr_prefix,
-                    K::get(self.data.column(1), i),
-                    V::get(self.data.column(2), i),
-                ));
+        prefix_range: PrefixRange,
+        key_range: KeyRange,
+    ) -> impl Iterator<Item = (K, V)> + 'me
+    where
+        PrefixRange: RangeBounds<&'prefix str>,
+        KeyRange: RangeBounds<K>,
+    {
+        let start_index = match prefix_range.start_bound() {
+            Bound::Included(prefix) => match key_range.start_bound() {
+                Bound::Included(key) => self.binary_search_prefix_key(prefix, key),
+                Bound::Excluded(key) => {
+                    let index = self.binary_search_prefix_key(prefix, key);
+                    if self.match_prefix_key_at_index(prefix, key, index) {
+                        index + 1
+                    } else {
+                        index
+                    }
+                }
+                Bound::Unbounded => match self.find_smallest_index_of_prefix::<K>(prefix) {
+                    Some(first_index_of_prefix) => first_index_of_prefix,
+                    None => self.len(), // prefix does not exist in the block so we shouldn't return anything
+                },
+            },
+            Bound::Excluded(_) => {
+                unimplemented!("Excluded prefix range is not currently supported")
             }
-        }
-        return Some(res);
-    }
+            Bound::Unbounded => 0,
+        };
 
-    /// Get all the values for a given prefix in the block where the key is greater than the given key
-    /// ### Panics
-    /// - If the underlying data types are not the same as the types specified in the function signature
-    pub fn get_gt<'me, K: ArrowReadableKey<'me>, V: ArrowReadableValue<'me>>(
-        &'me self,
-        prefix: &str,
-        key: K,
-    ) -> Option<Vec<(&str, K, V)>> {
-        let prefix_array = self
-            .data
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let mut res: Vec<(&str, K, V)> = vec![];
-        for i in 0..self.data.num_rows() {
-            let curr_prefix = prefix_array.value(i);
-            let curr_key = K::get(self.data.column(1), i);
-            if curr_prefix == prefix && curr_key > key {
-                res.push((curr_prefix, curr_key, V::get(self.data.column(2), i)));
+        let end_index = match prefix_range.end_bound() {
+            Bound::Included(prefix) => match key_range.end_bound() {
+                Bound::Included(key) => {
+                    let index = self.binary_search_prefix_key(prefix, key);
+                    if self.match_prefix_key_at_index(prefix, key, index) {
+                        index + 1
+                    } else {
+                        index
+                    }
+                }
+                Bound::Excluded(key) => self.binary_search_prefix_key::<K>(prefix, key),
+                Bound::Unbounded => match self.find_largest_index_of_prefix::<K>(prefix) {
+                    Some(last_index_of_prefix) => last_index_of_prefix + 1, // (add 1 because end_index is exclusive below)
+                    None => start_index, // prefix does not exist in the block so we shouldn't return anything
+                },
+            },
+            Bound::Excluded(_) => {
+                unimplemented!("Excluded prefix range is not currently supported")
             }
-        }
-        return Some(res);
-    }
+            Bound::Unbounded => self.len(),
+        };
 
-    /// Get all the values for a given prefix in the block where the key is less than the given key
-    /// ### Panics
-    /// - If the underlying data types are not the same as the types specified in the function signature
-    pub fn get_lt<'me, K: ArrowReadableKey<'me>, V: ArrowReadableValue<'me>>(
-        &'me self,
-        prefix: &str,
-        key: K,
-    ) -> Option<Vec<(&str, K, V)>> {
-        let prefix_array = self
-            .data
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let mut res: Vec<(&str, K, V)> = vec![];
-        for i in 0..self.data.num_rows() {
-            let curr_prefix = prefix_array.value(i);
-            let curr_key = K::get(self.data.column(1), i);
-            if curr_prefix == prefix && curr_key < key {
-                res.push((curr_prefix, curr_key, V::get(self.data.column(2), i)));
-            }
-        }
-        return Some(res);
-    }
-
-    /// Get all the values for a given prefix in the block where the key is less than or equal to the given key
-    /// ### Panics
-    /// - If the underlying data types are not the same as the types specified in the function signature
-    pub fn get_lte<'me, K: ArrowReadableKey<'me>, V: ArrowReadableValue<'me>>(
-        &'me self,
-        prefix: &str,
-        key: K,
-    ) -> Option<Vec<(&str, K, V)>> {
-        let prefix_array = self
-            .data
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let mut res: Vec<(&str, K, V)> = vec![];
-        for i in 0..self.data.num_rows() {
-            let curr_prefix = prefix_array.value(i);
-            let curr_key = K::get(self.data.column(1), i);
-            if curr_prefix == prefix && curr_key <= key {
-                res.push((curr_prefix, curr_key, V::get(self.data.column(2), i)));
-            }
-        }
-        return Some(res);
-    }
-
-    /// Get all the values for a given prefix in the block where the key is greater than or equal to the given key
-    /// ### Panics
-    /// - If the underlying data types are not the same as the types specified in the function signature
-    pub fn get_gte<'me, K: ArrowReadableKey<'me>, V: ArrowReadableValue<'me>>(
-        &'me self,
-        prefix: &str,
-        key: K,
-    ) -> Option<Vec<(&str, K, V)>> {
-        let prefix_array = self
-            .data
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let mut res: Vec<(&str, K, V)> = vec![];
-        for i in 0..self.data.num_rows() {
-            let curr_prefix = prefix_array.value(i);
-            let curr_key = K::get(self.data.column(1), i);
-            if curr_prefix == prefix && curr_key >= key {
-                res.push((curr_prefix, curr_key, V::get(self.data.column(2), i)));
-            }
-        }
-        return Some(res);
+        (start_index..end_index).map(move |index| {
+            (
+                K::get(self.data.column(1), index),
+                V::get(self.data.column(2), index),
+            )
+        })
     }
 
     /// Get all the values for a given prefix in the block where the key is between the given keys
@@ -256,7 +427,7 @@ impl Block {
     pub fn get_at_index<'me, K: ArrowReadableKey<'me>, V: ArrowReadableValue<'me>>(
         &'me self,
         index: usize,
-    ) -> Option<(&str, K, V)> {
+    ) -> Option<(&'me str, K, V)> {
         if index >= self.data.num_rows() {
             return None;
         }
@@ -277,18 +448,27 @@ impl Block {
     */
 
     /// Returns the size of the block in bytes
-    pub(crate) fn get_size(&self) -> usize {
+    pub fn get_size(&self) -> usize {
         let mut total_size = 0;
         for column in self.data.columns() {
             let array_data = column.to_data();
             total_size += get_size_of_array_data(&array_data);
         }
-        return total_size;
+        total_size
     }
 
     /// Returns the number of items in the block
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.data.num_rows()
+    }
+
+    /// Returns a reference to metadata of the block if any is present
+    /// ### Notes
+    /// - The metadata is stored in the Arrow RB schema as custom metadata
+    #[allow(dead_code)]
+    pub(crate) fn metadata(&self) -> &HashMap<String, String> {
+        let schema = self.data.schema_ref();
+        schema.metadata()
     }
 
     /*
@@ -331,30 +511,31 @@ impl Block {
         };
         match writer.write(&self.data) {
             Ok(_) => match writer.finish() {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    return Err(BlockSaveError::ArrowError(e));
-                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(BlockSaveError::ArrowError(e)),
             },
-            Err(e) => {
-                return Err(BlockSaveError::ArrowError(e));
-            }
+            Err(e) => Err(BlockSaveError::ArrowError(e)),
         }
     }
 
     /// Convert the block to bytes in Arrow IPC format
     pub fn to_bytes(&self) -> Result<Vec<u8>, BlockToBytesError> {
+        Self::record_batch_to_bytes(&self.data)
+    }
+
+    /// Convert the record batch to bytes in Arrow IPC format
+    fn record_batch_to_bytes(rb: &RecordBatch) -> Result<Vec<u8>, BlockToBytesError> {
         let mut bytes = Vec::new();
         // Scope the writer so that it is dropped before we return the bytes
         {
-            let mut writer =
-                match arrow::ipc::writer::FileWriter::try_new(&mut bytes, &self.data.schema()) {
-                    Ok(writer) => writer,
-                    Err(e) => {
-                        return Err(BlockToBytesError::ArrowError(e));
-                    }
-                };
-            match writer.write(&self.data) {
+            let mut writer = match arrow::ipc::writer::FileWriter::try_new(&mut bytes, &rb.schema())
+            {
+                Ok(writer) => writer,
+                Err(e) => {
+                    return Err(BlockToBytesError::ArrowError(e));
+                }
+            };
+            match writer.write(rb) {
                 Ok(_) => {}
                 Err(e) => {
                     return Err(BlockToBytesError::ArrowError(e));
@@ -372,7 +553,7 @@ impl Block {
 
     /// Load a block from bytes in Arrow IPC format with the given id
     pub fn from_bytes(bytes: &[u8], id: Uuid) -> Result<Self, BlockLoadError> {
-        return Self::from_bytes_internal(bytes, id, false);
+        Self::from_bytes_internal(bytes, id, false)
     }
 
     /// Load a block from bytes in Arrow IPC format with the given id and validate the layout
@@ -380,12 +561,12 @@ impl Block {
     /// - This method should be used in tests to ensure that the layout of the IPC file is as expected
     /// - The validation is not performant and should not be used in production code
     pub fn from_bytes_with_validation(bytes: &[u8], id: Uuid) -> Result<Self, BlockLoadError> {
-        return Self::from_bytes_internal(bytes, id, true);
+        Self::from_bytes_internal(bytes, id, true)
     }
 
     fn from_bytes_internal(bytes: &[u8], id: Uuid, validate: bool) -> Result<Self, BlockLoadError> {
         let cursor = std::io::Cursor::new(bytes);
-        return Self::load_with_reader(cursor, id, validate);
+        Self::load_with_reader(cursor, id, validate)
     }
 
     /// Load a block from the given path with the given id and validate the layout
@@ -393,12 +574,12 @@ impl Block {
     /// - This method should be used in tests to ensure that the layout of the IPC file is as expected
     /// - The validation is not performant and should not be used in production code
     pub fn load_with_validation(path: &str, id: Uuid) -> Result<Self, BlockLoadError> {
-        return Self::load_internal(path, id, true);
+        Self::load_internal(path, id, true)
     }
 
     /// Load a block from the given path with the given id
     pub fn load(path: &str, id: Uuid) -> Result<Self, BlockLoadError> {
-        return Self::load_internal(path, id, false);
+        Self::load_internal(path, id, false)
     }
 
     fn load_internal(path: &str, id: Uuid, validate: bool) -> Result<Self, BlockLoadError> {
@@ -410,29 +591,29 @@ impl Block {
             }
         };
         let reader = std::io::BufReader::new(file);
-        return Self::load_with_reader(reader, id, validate);
+        Self::load_with_reader(reader, id, validate)
     }
 
-    fn load_with_reader<R>(mut reader: R, id: Uuid, validate: bool) -> Result<Self, BlockLoadError>
+    fn load_with_reader<R>(reader: R, id: Uuid, validate: bool) -> Result<Self, BlockLoadError>
+    where
+        R: std::io::Read + std::io::Seek,
+    {
+        let batch = Self::load_record_batch(reader, validate)?;
+        // TODO: how to store / hydrate id?
+        Ok(Self::from_record_batch(id, batch))
+    }
+
+    fn load_record_batch<R>(mut reader: R, validate: bool) -> Result<RecordBatch, BlockLoadError>
     where
         R: std::io::Read + std::io::Seek,
     {
         if validate {
-            let res = verify_buffers_layout(&mut reader);
-            match res {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(BlockLoadError::ArrowLayoutVerificationError(e));
-                }
-            }
+            verify_buffers_layout(&mut reader)
+                .map_err(BlockLoadError::ArrowLayoutVerificationError)?;
         }
 
-        let mut arrow_reader = match arrow::ipc::reader::FileReader::try_new(&mut reader, None) {
-            Ok(arrow_reader) => arrow_reader,
-            Err(e) => {
-                return Err(BlockLoadError::ArrowError(e));
-            }
-        };
+        let mut arrow_reader = arrow::ipc::reader::FileReader::try_new(&mut reader, None)
+            .map_err(BlockLoadError::ArrowError)?;
 
         let batch = match arrow_reader.next() {
             Some(Ok(batch)) => batch,
@@ -443,9 +624,13 @@ impl Block {
                 return Err(BlockLoadError::NoRecordBatches);
             }
         };
+        Ok(batch)
+    }
+}
 
-        // TODO: how to store / hydrate id?
-        Ok(Self::from_record_batch(id, batch))
+impl chroma_cache::Weighted for Block {
+    fn weight(&self) -> usize {
+        8 // A block is at most 8 MB
     }
 }
 
@@ -486,7 +671,7 @@ fn get_size_of_array_data(array_data: &ArrayData) -> usize {
         let size = bit_util::round_upto_multiple_of_64(buffer.len());
         total_size += size;
     }
-    return total_size;
+    total_size
 }
 
 /*
@@ -534,6 +719,23 @@ pub enum BlockLoadError {
     ArrowLayoutVerificationError(#[from] ArrowLayoutVerificationError),
     #[error("No record batches in IPC file")]
     NoRecordBatches,
+    #[error(transparent)]
+    BlockToBytesError(#[from] crate::arrow::block::types::BlockToBytesError),
+    #[error(transparent)]
+    CacheError(#[from] chroma_cache::CacheError),
+}
+
+impl ChromaError for BlockLoadError {
+    fn code(&self) -> ErrorCodes {
+        match self {
+            BlockLoadError::IOError(_) => ErrorCodes::Internal,
+            BlockLoadError::ArrowError(_) => ErrorCodes::Internal,
+            BlockLoadError::ArrowLayoutVerificationError(_) => ErrorCodes::Internal,
+            BlockLoadError::NoRecordBatches => ErrorCodes::Internal,
+            BlockLoadError::BlockToBytesError(_) => ErrorCodes::Internal,
+            BlockLoadError::CacheError(_) => ErrorCodes::Internal,
+        }
+    }
 }
 
 /*
@@ -562,10 +764,8 @@ pub enum ArrowLayoutVerificationError {
 
 impl ChromaError for ArrowLayoutVerificationError {
     fn code(&self) -> ErrorCodes {
-        match self {
-            // All errors are internal for this error type
-            _ => ErrorCodes::Internal,
-        }
+        // All errors are internal for this error type
+        ErrorCodes::Internal
     }
 }
 
@@ -582,49 +782,26 @@ where
     // size calculation assumes that the buffers are 64 byte aligned
     // Space for ARROW_MAGIC (6 bytes) and length (4 bytes)
     let mut footer_buffer = [0; 10];
-    match reader.seek(SeekFrom::End(-10)) {
-        Ok(_) => {}
-        Err(e) => {
-            return Err(ArrowLayoutVerificationError::IOError(e));
-        }
-    }
-
-    match reader.read_exact(&mut footer_buffer) {
-        Ok(_) => {}
-        Err(e) => {
-            return Err(ArrowLayoutVerificationError::IOError(e));
-        }
-    }
+    reader
+        .seek(SeekFrom::End(-10))
+        .map_err(ArrowLayoutVerificationError::IOError)?;
+    reader
+        .read_exact(&mut footer_buffer)
+        .map_err(ArrowLayoutVerificationError::IOError)?;
 
     let footer_len = read_footer_length(footer_buffer);
-    let footer_len = match footer_len {
-        Ok(footer_len) => footer_len,
-        Err(e) => {
-            return Err(ArrowLayoutVerificationError::ArrowError(e));
-        }
-    };
+    let footer_len = footer_len.map_err(ArrowLayoutVerificationError::ArrowError)?;
 
     // read footer
     let mut footer_data = vec![0; footer_len];
-    match reader.seek(SeekFrom::End(-10 - footer_len as i64)) {
-        Ok(_) => {}
-        Err(e) => {
-            return Err(ArrowLayoutVerificationError::IOError(e));
-        }
-    }
-    match reader.read_exact(&mut footer_data) {
-        Ok(_) => {}
-        Err(e) => {
-            return Err(ArrowLayoutVerificationError::IOError(e));
-        }
-    }
-
-    let footer = match root_as_footer(&footer_data) {
-        Ok(footer) => footer,
-        Err(e) => {
-            return Err(ArrowLayoutVerificationError::InvalidFlatbuffer(e));
-        }
-    };
+    reader
+        .seek(SeekFrom::End(-10 - footer_len as i64))
+        .map_err(ArrowLayoutVerificationError::IOError)?;
+    reader
+        .read_exact(&mut footer_data)
+        .map_err(ArrowLayoutVerificationError::IOError)?;
+    let footer =
+        root_as_footer(&footer_data).map_err(ArrowLayoutVerificationError::InvalidFlatbuffer)?;
 
     // Read the record batch
     let record_batch_definitions = match footer.recordBatches() {

@@ -1,10 +1,7 @@
 mod assignment;
 mod compactor;
 mod config;
-mod execution;
-mod log;
 mod memberlist;
-mod segment;
 mod server;
 mod sysdb;
 mod system;
@@ -16,6 +13,11 @@ use memberlist::MemberlistProvider;
 
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
+
+// Required for benchmark
+pub mod execution;
+pub mod log;
+pub mod segment;
 
 const CONFIG_PATH_ENV_VAR: &str = "CONFIG_PATH";
 
@@ -71,9 +73,10 @@ pub async fn query_service_entrypoint() {
         // TODO: add more signal handling
         _ = sigterm.recv() => {
             dispatcher_handle.stop();
-            dispatcher_handle.join().await;
+            let _ = dispatcher_handle.join().await;
             system.stop().await;
             system.join().await;
+            let _ = server_join_handle.await;
         },
     };
     println!("Server stopped");
@@ -145,11 +148,11 @@ pub async fn compaction_service_entrypoint() {
         // TODO: add more signal handling
         _ = sigterm.recv() => {
             memberlist_handle.stop();
-            memberlist_handle.join().await;
+            let _ = memberlist_handle.join().await;
             dispatcher_handle.stop();
-            dispatcher_handle.join().await;
+            let _ = dispatcher_handle.join().await;
             compaction_manager_handle.stop();
-            compaction_manager_handle.join().await;
+            let _ = compaction_manager_handle.join().await;
             system.stop().await;
             system.join().await;
         },

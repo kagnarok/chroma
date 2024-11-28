@@ -17,6 +17,7 @@ use chroma_config::Configurable;
 use chroma_error::{ChromaError, ErrorCodes};
 use chroma_index::hnsw_provider::HnswIndexProvider;
 use chroma_storage::Storage;
+use chroma_types::CollectionUuid;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use std::fmt::Debug;
@@ -36,6 +37,7 @@ pub(crate) struct CompactionManager {
     // Dependencies
     log: Box<Log>,
     sysdb: Box<SysDb>,
+    #[allow(dead_code)]
     storage: Storage,
     blockfile_provider: BlockfileProvider,
     hnsw_index_provider: HnswIndexProvider,
@@ -44,7 +46,10 @@ pub(crate) struct CompactionManager {
     // Config
     compaction_manager_queue_size: usize,
     compaction_interval: Duration,
+    #[allow(dead_code)]
     min_compaction_size: usize,
+    max_compaction_size: usize,
+    max_partition_size: usize,
 }
 
 #[derive(Error, Debug)]
@@ -62,6 +67,7 @@ impl ChromaError for CompactionError {
 }
 
 impl CompactionManager {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         scheduler: Scheduler,
         log: Box<Log>,
@@ -72,6 +78,8 @@ impl CompactionManager {
         compaction_manager_queue_size: usize,
         compaction_interval: Duration,
         min_compaction_size: usize,
+        max_compaction_size: usize,
+        max_partition_size: usize,
     ) -> Self {
         CompactionManager {
             system: None,
@@ -85,6 +93,8 @@ impl CompactionManager {
             compaction_manager_queue_size,
             compaction_interval,
             min_compaction_size,
+            max_compaction_size,
+            max_partition_size,
         }
     }
 
@@ -114,16 +124,18 @@ impl CompactionManager {
                     dispatcher,
                     None,
                     None,
-                    Arc::new(AtomicU32::new(0)),
+                    Arc::new(AtomicU32::new(1)),
+                    self.max_compaction_size,
+                    self.max_partition_size,
                 );
 
                 match orchestrator.run().await {
                     Ok(result) => {
-                        println!("Compaction Job completed");
+                        tracing::info!("Compaction Job completed: {:?}", result);
                         return Ok(result);
                     }
                     Err(e) => {
-                        println!("Compaction Job failed");
+                        tracing::error!("Compaction Job failed: {:?}", e);
                         return Err(e);
                     }
                 }
@@ -137,7 +149,10 @@ impl CompactionManager {
 
     // TODO: make the return type more informative
     #[instrument(name = "CompactionManager::compact_batch")]
-    pub(crate) async fn compact_batch(&mut self) -> (u32, u32) {
+    pub(crate) async fn compact_batch(
+        &mut self,
+        compacted: &mut Vec<CollectionUuid>,
+    ) -> (u32, u32) {
         self.scheduler.schedule().await;
         let mut jobs = FuturesUnordered::new();
         for job in self.scheduler.get_jobs() {
@@ -153,6 +168,7 @@ impl CompactionManager {
             match job {
                 Ok(result) => {
                     println!("Compaction completed: {:?}", result);
+                    compacted.push(result.compaction_job.collection_id);
                     num_completed_jobs += 1;
                 }
                 Err(e) => {
@@ -206,6 +222,8 @@ impl Configurable<CompactionServiceConfig> for CompactionManager {
         let max_concurrent_jobs = config.compactor.max_concurrent_jobs;
         let compaction_manager_queue_size = config.compactor.compaction_manager_queue_size;
         let min_compaction_size = config.compactor.min_compaction_size;
+        let max_compaction_size = config.compactor.max_compaction_size;
+        let max_partition_size = config.compactor.max_partition_size;
 
         let assignment_policy_config = &config.assignment_policy;
         let assignment_policy = match crate::assignment::from_config(assignment_policy_config).await
@@ -245,6 +263,8 @@ impl Configurable<CompactionServiceConfig> for CompactionManager {
             compaction_manager_queue_size,
             Duration::from_secs(compaction_interval_sec),
             min_compaction_size,
+            max_compaction_size,
+            max_partition_size,
         ))
     }
 }
@@ -271,7 +291,7 @@ impl Component for CompactionManager {
 
 impl Debug for CompactionManager {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CompactionManager")
+        f.debug_struct("CompactionManager").finish()
     }
 }
 
@@ -286,9 +306,10 @@ impl Handler<ScheduleMessage> for CompactionManager {
         ctx: &ComponentContext<CompactionManager>,
     ) {
         println!("CompactionManager: Performing compaction");
-        self.compact_batch().await;
+        let mut ids = Vec::new();
+        self.compact_batch(&mut ids).await;
 
-        self.hnsw_index_provider.purge_all_entries().await;
+        self.hnsw_index_provider.purge_by_id(&ids).await;
 
         // Compaction is done, schedule the next compaction
         ctx.scheduler
@@ -317,29 +338,30 @@ mod tests {
     use crate::log::log::InternalLogRecord;
     use crate::sysdb::test_sysdb::TestSysDb;
     use chroma_blockstore::arrow::config::TEST_MAX_BLOCK_SIZE_BYTES;
-    use chroma_cache::{cache::Cache, config::CacheConfig, config::UnboundedCacheConfig};
+    use chroma_cache::{new_cache_for_test, new_non_persistent_cache_for_test};
     use chroma_storage::local::LocalStorage;
+    use chroma_types::SegmentUuid;
     use chroma_types::{Collection, LogRecord, Operation, OperationRecord, Segment};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::str::FromStr;
-    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_compaction_manager() {
         let mut log = Box::new(Log::InMemory(InMemoryLog::new()));
-        let mut in_memory_log = match *log {
+        let in_memory_log = match *log {
             Log::InMemory(ref mut log) => log,
             _ => panic!("Expected InMemoryLog"),
         };
         let tmpdir = tempfile::tempdir().unwrap();
         let storage = Storage::Local(LocalStorage::new(tmpdir.path().to_str().unwrap()));
 
-        let collection_uuid_1 = Uuid::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let collection_uuid_1 =
+            CollectionUuid::from_str("00000000-0000-0000-0000-000000000001").unwrap();
         in_memory_log.add_log(
-            collection_uuid_1.clone(),
-            Box::new(InternalLogRecord {
-                collection_id: collection_uuid_1.clone(),
+            collection_uuid_1,
+            InternalLogRecord {
+                collection_id: collection_uuid_1,
                 log_offset: 0,
                 log_ts: 1,
                 record: LogRecord {
@@ -353,14 +375,15 @@ mod tests {
                         operation: Operation::Add,
                     },
                 },
-            }),
+            },
         );
 
-        let collection_uuid_2 = Uuid::from_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let collection_uuid_2 =
+            CollectionUuid::from_str("00000000-0000-0000-0000-000000000002").unwrap();
         in_memory_log.add_log(
-            collection_uuid_2.clone(),
-            Box::new(InternalLogRecord {
-                collection_id: collection_uuid_2.clone(),
+            collection_uuid_2,
+            InternalLogRecord {
+                collection_id: collection_uuid_2,
                 log_offset: 0,
                 log_ts: 2,
                 record: LogRecord {
@@ -374,14 +397,14 @@ mod tests {
                         operation: Operation::Add,
                     },
                 },
-            }),
+            },
         );
 
         let mut sysdb = Box::new(SysDb::Test(TestSysDb::new()));
 
         let tenant_1 = "tenant_1".to_string();
         let collection_1 = Collection {
-            id: collection_uuid_1,
+            collection_id: collection_uuid_1,
             name: "collection_1".to_string(),
             metadata: None,
             dimension: Some(1),
@@ -393,7 +416,7 @@ mod tests {
 
         let tenant_2 = "tenant_2".to_string();
         let collection_2 = Collection {
-            id: collection_uuid_2,
+            collection_id: collection_uuid_2,
             name: "collection_2".to_string(),
             metadata: None,
             dimension: Some(1),
@@ -411,7 +434,7 @@ mod tests {
         }
 
         let collection_1_record_segment = Segment {
-            id: Uuid::new_v4(),
+            id: SegmentUuid::new(),
             r#type: chroma_types::SegmentType::BlockfileRecord,
             scope: chroma_types::SegmentScope::RECORD,
             collection: collection_uuid_1,
@@ -420,7 +443,7 @@ mod tests {
         };
 
         let collection_2_record_segment = Segment {
-            id: Uuid::new_v4(),
+            id: SegmentUuid::new(),
             r#type: chroma_types::SegmentType::BlockfileRecord,
             scope: chroma_types::SegmentScope::RECORD,
             collection: collection_uuid_2,
@@ -429,7 +452,7 @@ mod tests {
         };
 
         let collection_1_hnsw_segment = Segment {
-            id: Uuid::new_v4(),
+            id: SegmentUuid::new(),
             r#type: chroma_types::SegmentType::HnswDistributed,
             scope: chroma_types::SegmentScope::VECTOR,
             collection: collection_uuid_1,
@@ -438,7 +461,7 @@ mod tests {
         };
 
         let collection_2_hnsw_segment = Segment {
-            id: Uuid::new_v4(),
+            id: SegmentUuid::new(),
             r#type: chroma_types::SegmentType::HnswDistributed,
             scope: chroma_types::SegmentScope::VECTOR,
             collection: collection_uuid_2,
@@ -447,7 +470,7 @@ mod tests {
         };
 
         let collection_1_metadata_segment = Segment {
-            id: Uuid::new_v4(),
+            id: SegmentUuid::new(),
             r#type: chroma_types::SegmentType::BlockfileMetadata,
             scope: chroma_types::SegmentScope::METADATA,
             collection: collection_uuid_1,
@@ -456,7 +479,7 @@ mod tests {
         };
 
         let collection_2_metadata_segment = Segment {
-            id: Uuid::new_v4(),
+            id: SegmentUuid::new(),
             r#type: chroma_types::SegmentType::BlockfileMetadata,
             scope: chroma_types::SegmentScope::METADATA,
             collection: collection_uuid_2,
@@ -485,6 +508,8 @@ mod tests {
         let max_concurrent_jobs = 10;
         let compaction_interval = Duration::from_secs(1);
         let min_compaction_size = 0;
+        let max_compaction_size = 1000;
+        let max_partition_size = 1000;
 
         // Set assignment policy
         let mut assignment_policy = Box::new(RendezvousHashingAssignmentPolicy::new());
@@ -502,9 +527,10 @@ mod tests {
         // Set memberlist
         scheduler.set_memberlist(vec![my_member_id.clone()]);
 
-        let block_cache = Cache::new(&CacheConfig::Unbounded(UnboundedCacheConfig {}));
-        let sparse_index_cache = Cache::new(&CacheConfig::Unbounded(UnboundedCacheConfig {}));
-        let hnsw_cache = Cache::new(&CacheConfig::Unbounded(UnboundedCacheConfig {}));
+        let block_cache = new_cache_for_test();
+        let sparse_index_cache = new_cache_for_test();
+        let hnsw_cache = new_non_persistent_cache_for_test();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut manager = CompactionManager::new(
             scheduler,
             log,
@@ -520,10 +546,13 @@ mod tests {
                 storage,
                 PathBuf::from(tmpdir.path().to_str().unwrap()),
                 hnsw_cache,
+                rx,
             ),
             compaction_manager_queue_size,
             compaction_interval,
             min_compaction_size,
+            max_compaction_size,
+            max_partition_size,
         );
 
         let system = System::new();
@@ -532,8 +561,13 @@ mod tests {
         let dispatcher_handle = system.start_component(dispatcher);
         manager.set_dispatcher(dispatcher_handle);
         manager.set_system(system);
-        let (num_completed, number_failed) = manager.compact_batch().await;
+        let mut compacted = vec![];
+        let (num_completed, number_failed) = manager.compact_batch(&mut compacted).await;
         assert_eq!(num_completed, 2);
         assert_eq!(number_failed, 0);
+        assert!(
+            (compacted == vec![collection_uuid_1, collection_uuid_2])
+                || (compacted == vec![collection_uuid_2, collection_uuid_1])
+        );
     }
 }

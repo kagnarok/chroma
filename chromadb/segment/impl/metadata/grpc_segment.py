@@ -1,8 +1,10 @@
 from typing import Dict, List, Optional, Sequence
+from chromadb.proto.convert import to_proto_request_version_context
 from chromadb.proto.utils import RetryOnRpcErrorClientInterceptor
 from chromadb.segment import MetadataReader
 from chromadb.config import System
-from chromadb.types import Segment
+from chromadb.errors import InvalidArgumentError, VersionMismatchError
+from chromadb.types import Segment, RequestVersionContext
 from overrides import override
 from chromadb.telemetry.opentelemetry import (
     OpenTelemetryGranularity,
@@ -47,14 +49,24 @@ class GrpcMetadataSegment(MetadataReader):
         self._metadata_reader_stub = MetadataReaderStub(channel)  # type: ignore
 
     @override
-    def count(self) -> int:
+    def count(self, request_version_context: RequestVersionContext) -> int:
         request: pb.CountRecordsRequest = pb.CountRecordsRequest(
             segment_id=self._segment["id"].hex,
             collection_id=self._segment["collection"].hex,
+            version_context=to_proto_request_version_context(request_version_context),
         )
-        response: pb.CountRecordsResponse = self._metadata_reader_stub.CountRecords(
-            request, timeout=self._request_timeout_seconds
-        )
+
+        try:
+            response: pb.CountRecordsResponse = self._metadata_reader_stub.CountRecords(
+                request,
+                timeout=self._request_timeout_seconds,
+            )
+        except grpc.RpcError as rpc_error:
+            message = rpc_error.details()
+            if "Collection version mismatch" in message:
+                raise VersionMismatchError()
+            raise rpc_error
+
         return response.count
 
     @override
@@ -72,13 +84,21 @@ class GrpcMetadataSegment(MetadataReader):
     @override
     def get_metadata(
         self,
+        request_version_context: RequestVersionContext,
         where: Optional[Where] = None,
         where_document: Optional[WhereDocument] = None,
         ids: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        include_metadata: bool = True,
     ) -> Sequence[MetadataEmbeddingRecord]:
         """Query for embedding metadata."""
+
+        if limit is not None and limit < 0:
+            raise InvalidArgumentError(f"Limit cannot be negative: {limit}")
+
+        if offset is not None and offset < 0:
+            raise InvalidArgumentError(f"Offset cannot be negative: {offset}")
 
         request: pb.QueryMetadataRequest = pb.QueryMetadataRequest(
             segment_id=self._segment["id"].hex,
@@ -91,19 +111,26 @@ class GrpcMetadataSegment(MetadataReader):
                 if where_document is not None and len(where_document) > 0
                 else None
             ),
-            ids=ids,
+            ids=pb.UserIds(ids=ids) if ids is not None else None,
             limit=limit,
             offset=offset,
+            include_metadata=include_metadata,
+            version_context=to_proto_request_version_context(request_version_context),
         )
-        limit = limit or 2**63 - 1
-        offset = offset or 0
 
-        if limit and limit < 0:
-            raise ValueError("Limit cannot be negative")
+        try:
+            response: pb.QueryMetadataResponse = (
+                self._metadata_reader_stub.QueryMetadata(
+                    request,
+                    timeout=self._request_timeout_seconds,
+                )
+            )
+        except grpc.RpcError as rpc_error:
+            message = rpc_error.details()
+            if "Collection version mismatch" in message:
+                raise VersionMismatchError()
+            raise rpc_error
 
-        response: pb.QueryMetadataResponse = self._metadata_reader_stub.QueryMetadata(
-            request, timeout=self._request_timeout_seconds
-        )
         results: List[MetadataEmbeddingRecord] = []
         for record in response.records:
             result = self._from_proto(record)

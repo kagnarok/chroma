@@ -1,8 +1,7 @@
 use crate::execution::operator::{Operator, OperatorType};
 use crate::log::log::{Log, PullLogsError};
 use async_trait::async_trait;
-use chroma_types::{Chunk, LogRecord};
-use uuid::Uuid;
+use chroma_types::{Chunk, CollectionUuid, LogRecord};
 
 /// The pull logs operator is responsible for reading logs from the log service.
 #[derive(Debug)]
@@ -28,7 +27,7 @@ impl PullLogsOperator {
 /// * `end_timestamp` - The end timestamp to read logs until.
 #[derive(Debug)]
 pub struct PullLogsInput {
-    collection_id: Uuid,
+    collection_id: CollectionUuid,
     offset: i64,
     batch_size: i32,
     num_records: Option<i32>,
@@ -44,7 +43,7 @@ impl PullLogsInput {
     /// * `num_records` - The maximum number of records to read.
     /// * `end_timestamp` - The end timestamp to read logs until.
     pub fn new(
-        collection_id: Uuid,
+        collection_id: CollectionUuid,
         offset: i64,
         batch_size: i32,
         num_records: Option<i32>,
@@ -151,20 +150,21 @@ mod tests {
     use super::*;
     use crate::log::log::InMemoryLog;
     use crate::log::log::InternalLogRecord;
-    use chroma_types::{LogRecord, Operation, OperationRecord};
+    use chroma_types::{CollectionUuid, LogRecord, Operation, OperationRecord};
     use std::str::FromStr;
 
     #[tokio::test]
     async fn test_pull_logs() {
         let mut log = Box::new(Log::InMemory(InMemoryLog::new()));
-        let collection_uuid_1 = Uuid::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let collection_uuid_1 =
+            CollectionUuid::from_str("00000000-0000-0000-0000-000000000001").unwrap();
 
         match *log {
             Log::InMemory(ref mut log) => {
                 log.add_log(
-                    collection_uuid_1.clone(),
-                    Box::new(InternalLogRecord {
-                        collection_id: collection_uuid_1.clone(),
+                    collection_uuid_1,
+                    InternalLogRecord {
+                        collection_id: collection_uuid_1,
                         log_offset: 0,
                         log_ts: 1,
                         record: LogRecord {
@@ -178,12 +178,12 @@ mod tests {
                                 operation: Operation::Add,
                             },
                         },
-                    }),
+                    },
                 );
                 log.add_log(
-                    collection_uuid_1.clone(),
-                    Box::new(InternalLogRecord {
-                        collection_id: collection_uuid_1.clone(),
+                    collection_uuid_1,
+                    InternalLogRecord {
+                        collection_id: collection_uuid_1,
                         log_offset: 1,
                         log_ts: 2,
                         record: LogRecord {
@@ -197,7 +197,7 @@ mod tests {
                                 operation: Operation::Add,
                             },
                         },
-                    }),
+                    },
                 );
             }
             _ => panic!("Expected InMemoryLog"),
